@@ -95,7 +95,13 @@ class STTWordsToDigits():
             return
 
 
-        self._separator_symbol=Locale(self._current_locale.locale).number_symbols['latn']['decimal']
+        symbols = Locale(self._current_locale.locale).number_symbols
+        if 'latn' in symbols:
+            self._separator_symbol = symbols['latn']['decimal']
+        elif 'decimal' in symbols:
+            self._separator_symbol = symbols['decimal']
+        else:
+            self._separator_symbol = '.'
         self.can_use_digits=True
 
     def _current_locale_changed_cb(self, current_locale):

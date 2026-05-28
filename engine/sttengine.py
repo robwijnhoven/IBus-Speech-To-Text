@@ -427,16 +427,16 @@ class STTEngine(IBus.Engine):
         # Note : there could be text to write even after cancellation ("cancel
         # write this").
         if utterance != "":
-            self.commit_text(IBus.Text.new_from_string(utterance))
+            paste_text = utterance.lstrip(' ')
+            if paste_text != utterance:
+                paste_text = paste_text + ' '
+            subprocess.run(["wl-copy", "--", paste_text], timeout=2)
+            subprocess.run(["ydotool", "key", "ctrl+v"], timeout=2)
             self._left_text+=utterance
             self._left_text_reset=False
             LOG_MSG.debug("current left text (after commit) (%s)", self._left_text)
 
     def _got_partial_text(self, engine, utterance):
-        if (self.client_capabilities & IBus.Capabilite.PREEDIT_TEXT) == 0:
-            LOG_MSG.debug("client has no Preedit capability")
-            return
-
         if self._format_preedit == True:
             self._text_processor.utterance_process_begin(utterance, self._left_text)
         else:

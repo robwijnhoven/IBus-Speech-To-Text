@@ -13,7 +13,20 @@ from sttcurrentlocale import stt_current_locale
 from sttwhispermodel import STTWhisperModel
 
 LOG_MSG = logging.getLogger()
-SPECIAL_PATTERN = re.compile(r'^(?:\[[^\]]+\]|\([^)]+\))$',re.IGNORECASE)
+SPECIAL_PATTERN = re.compile(r'^(?:\[[^\]]+\]|\([^)]+\)|\*[^*]+\*)$',re.IGNORECASE)
+_HALLUCINATIONS = {
+    "thank you", "thank you.", "thanks.", "thanks",
+    "you", "you.", "bye.", "bye",
+    "all right.", "all right", "alright.", "alright",
+    "okay.", "okay", "oh.", "oh",
+    "hmm.", "hmm", "um.", "um", "uh.", "uh",
+    "yes.", "yes", "no.", "no",
+    "so.", "so", "well.", "well",
+    "i'm sorry.", "sorry.", "sorry",
+    "good.", "good", "right.", "right",
+    "hello.", "hello", "hi.", "hi",
+    "yeah.", "yeah", "yep.", "yep",
+}
 
 try:
     from pywhispercpp.model import Model
@@ -33,10 +46,12 @@ MIN_SAMPLES         = 1024
 SAMPLE_RATE         = 16000
 AUDIO_CTX           = 768
 TEMPERATURE_INC     = -1.0
-MAX_TOKENS          = 32
+MAX_TOKENS          = 256
 _cpu_count = os.cpu_count() or 1
 N_THREADS           = max(4, _cpu_count // 2 )
 MAX_RING_QUEUE_DEPTH = 2
+PARTIAL_INTERVAL_S  = 1.0
+MIN_SEGMENT_PROB    = 0.35
 
 class STTGstWhisper(STTGstBase):
     __gtype_name__ = 'STTGstWhisper'
@@ -91,9 +106,9 @@ class STTGstWhisper(STTGstBase):
         if VAD_MODULE_OK:
             self._vad = STTVad(
                 speech_threshold=0.5,
-                silence_duration_ms=800, #600
+                silence_duration_ms=800,
                 speech_pad_ms=200,
-                min_speech_duration_ms=500, #300
+                min_speech_duration_ms=300,
                 max_speech_duration_s=15.0,
                 freq_thold=100.0,
             )
@@ -106,6 +121,8 @@ class STTGstWhisper(STTGstBase):
         self._process_thread  = None
         self._stop_processing = False
         self._use_partial_results = False
+        self._partial_timer_id = 0
+        self._last_partial_samples = 0
 
     def __del__(self):
         LOG_MSG.info("Whisper __del__")
@@ -115,6 +132,7 @@ class STTGstWhisper(STTGstBase):
         super().__del__()
 
     def destroy(self):
+        self._stop_partial_timer()
         self._stop_processing = True
         if self._process_thread is not None:
             self._process_thread.join(timeout=2.0)
@@ -157,9 +175,9 @@ class STTGstWhisper(STTGstBase):
                 temperature_inc=TEMPERATURE_INC,
                 max_tokens=MAX_TOKENS,
                 n_threads=N_THREADS,
-                no_speech_thold=0.6,
-                logprob_thold=-1.5,
-                entropy_thold=2.8,
+                no_speech_thold=0.5,
+                logprob_thold=-1.0,
+                entropy_thold=2.4,
                 suppress_blank=True,
             )
 
@@ -235,10 +253,17 @@ class STTGstWhisper(STTGstBase):
         audio_float = audio_data.astype(np.float32) / 32768.0
 
         if self._vad is not None:
+            was_in_speech = self._vad._in_speech
             segments = self._vad.process(audio_float)
             for segment in segments:
                 LOG_MSG.debug("VAD segment ready: %.2f s", len(segment) / SAMPLE_RATE)
+                self._stop_partial_timer()
                 self._enqueue_for_transcription(segment, source='vad')
+
+            if self._use_partial_results and self._vad._in_speech and self._partial_timer_id == 0:
+                self._start_partial_timer()
+            elif not self._vad._in_speech and self._partial_timer_id != 0:
+                self._stop_partial_timer()
         else:
             self._chunk_buffer.append(audio_data)
             self._chunk_samples += len(audio_data)
@@ -273,7 +298,20 @@ class STTGstWhisper(STTGstBase):
         self._enqueue_for_transcription(snapshot, source='ring')
 
     def _enqueue_for_transcription(self, audio_float32: np.ndarray, source: str):
-        if source == 'ring':
+        if source == 'partial':
+            temp = []
+            while True:
+                try:
+                    item = self._process_queue.get_nowait()
+                    if item[0] == 'partial':
+                        self._process_queue.task_done()
+                    else:
+                        temp.append(item)
+                except queue.Empty:
+                    break
+            for item in temp:
+                self._process_queue.put(item)
+        elif source == 'ring':
             pending_ring = sum(
                 1 for item in list(self._process_queue.queue)
                 if item[0] == 'ring'
@@ -316,6 +354,7 @@ class STTGstWhisper(STTGstBase):
                 LOG_MSG.debug("Starting transcription of %d samples", len(audio))
                 segments = self._whisper.transcribe(audio)
                 text_parts = []
+                low_confidence = False
                 for segment in segments:
                     if not hasattr(segment, 'text'):
                         continue
@@ -324,15 +363,33 @@ class STTGstWhisper(STTGstBase):
                     if SPECIAL_PATTERN.match(segment_text):
                         continue
 
+                    prob = getattr(segment, 'probability', float('nan'))
+                    if prob == prob and prob < MIN_SEGMENT_PROB:
+                        LOG_MSG.debug("Low confidence segment (%.3f): '%s'",
+                                      prob, segment_text)
+                        low_confidence = True
+                        continue
+
                     if segment_text:
                         text_parts.append(segment_text)
-                        LOG_MSG.debug("Segment text: '%s'", segment_text)
+                        LOG_MSG.debug("Segment text: '%s' (prob=%.3f)",
+                                      segment_text, prob)
 
                 text = ' '.join(text_parts).strip()
 
-                if text:
-                    LOG_MSG.info("Whisper transcription result: '%s'", text)
-                    GLib.idle_add(self._emit_text, text)
+                if text and text.lower() not in _HALLUCINATIONS:
+                    if source == 'partial':
+                        LOG_MSG.debug("Partial transcription: '%s'", text)
+                        GLib.idle_add(self._emit_partial_text, text)
+                    else:
+                        if text and text[-1] not in '.?!':
+                            text += '.'
+                        LOG_MSG.info("Whisper transcription result: '%s'", text)
+                        GLib.idle_add(self._emit_text, text)
+                elif text:
+                    LOG_MSG.debug("Filtered hallucination: '%s'", text)
+                elif low_confidence:
+                    LOG_MSG.info("Discarded low-confidence audio segment")
                 else:
                     LOG_MSG.debug("No text transcribed from audio")
 
@@ -340,6 +397,34 @@ class STTGstWhisper(STTGstBase):
                 LOG_MSG.error("Whisper transcription error: %s", e, exc_info=True)
 
             self._process_queue.task_done()
+
+    def _start_partial_timer(self):
+        self._last_partial_samples = 0
+        self._partial_timer_id = GLib.timeout_add(
+            int(PARTIAL_INTERVAL_S * 1000), self._on_partial_tick)
+
+    def _stop_partial_timer(self):
+        if self._partial_timer_id != 0:
+            GLib.source_remove(self._partial_timer_id)
+            self._partial_timer_id = 0
+        self._last_partial_samples = 0
+
+    def _on_partial_tick(self):
+        if self._vad is None or not self._vad._in_speech:
+            self._partial_timer_id = 0
+            return False
+
+        pending = self._vad.get_pending_audio()
+        if pending is None or len(pending) == self._last_partial_samples:
+            return True
+
+        self._last_partial_samples = len(pending)
+        self._enqueue_for_transcription(pending, source='partial')
+        return True
+
+    def _emit_partial_text(self, text):
+        self.emit("partial-text", text)
+        return False
 
     def _emit_text(self, text):
         self.emit("text", text)
