@@ -405,9 +405,10 @@ class STTEngine(IBus.Engine):
 
     def _update_status_labels(self):
         running = self._engine.is_running()
-        run_led = _LED_GREEN if running else _LED_RED
 
-        # Microphone signal + energy-history LED.
+        # Microphone LED is the only live-activity indicator: red when not
+        # recording or no signal seen yet, green while audio is flowing,
+        # orange once it has gone quiet for a while.
         level = self._engine.get_audio_level() if hasattr(self._engine, "get_audio_level") else 0.0
         if running:
             if level > _ENERGY_THRESHOLD:
@@ -425,22 +426,32 @@ class STTEngine(IBus.Engine):
         self._set_label("signal-status",
                         "%s  %s" % (mic_led, self._format_signal(level, running)))
 
-        # VAD status.
+        # VAD LED reflects backend availability, not whether we are recording:
+        # green = backend loaded and ready, red = unavailable. The text still
+        # shows the live speaking/idle state.
         if hasattr(self._engine, "get_vad_status"):
             backend, in_speech = self._engine.get_vad_status()
         else:
             backend, in_speech = ("", False)
         if backend:
+            vad_led = _LED_GREEN
             state = _("speaking") if (running and in_speech) else _("idle")
             vad_text = "%s · %-8s" % (backend, state)
         else:
+            vad_led = _LED_RED
             vad_text = _("VAD: unavailable")
-        self._set_label("vad-status", "%s  %s" % (run_led, vad_text))
+        self._set_label("vad-status", "%s  %s" % (vad_led, vad_text))
 
-        # Active model.
+        # Model LED reflects whether a model is loaded/ready, independent of
+        # recording: green = model up, red = none / failed to load.
         name = self._engine.get_model_name() if hasattr(self._engine, "get_model_name") else None
-        model_text = _("Model: %s") % (name if name else _("none"))
-        self._set_label("model-status", "%s  %s" % (run_led, model_text))
+        if name:
+            model_led = _LED_GREEN
+            model_text = _("Model: %s") % name
+        else:
+            model_led = _LED_RED
+            model_text = _("Model: %s") % _("none")
+        self._set_label("model-status", "%s  %s" % (model_led, model_text))
 
     def _on_status_tick(self):
         if not self._engine.is_running():
@@ -635,8 +646,9 @@ class STTEngine(IBus.Engine):
             paste_text = utterance.lstrip(' ')
             if paste_text != utterance:
                 paste_text = paste_text + ' '
-            subprocess.run(["wl-copy", "--", paste_text], timeout=2)
-            subprocess.run(["ydotool", "key", "ctrl+v"], timeout=2)
+            subprocess.run(["xclip", "-selection", "clipboard"],
+                           input=paste_text.encode("utf-8"), timeout=2)
+            subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"], timeout=2)
             self._left_text+=utterance
             self._left_text_reset=False
             LOG_MSG.debug("current left text (after commit) (%s)", self._left_text)
