@@ -6,7 +6,7 @@ import re
 import os
 
 from pathlib import Path
-from gi.repository import Gst, GLib
+from gi.repository import Gst, GLib, Gio
 from sttutils import *
 from sttgstbase import STTGstBase
 from sttcurrentlocale import stt_current_locale
@@ -55,13 +55,13 @@ MIN_SEGMENT_PROB    = 0.35
 
 class STTGstWhisper(STTGstBase):
     __gtype_name__ = 'STTGstWhisper'
-    _pipeline_def = "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! " \
+    _pipeline_def = "pulsesrc name=stt_audio_src blocksize=3200 buffer-time=9223372036854775807 ! " \
                     "audio/x-raw,format=S16LE,rate=16000,channels=1 ! " \
                     "webrtcdsp noise-suppression-level=3 echo-cancel=false ! " \
                     "queue ! " \
                     "appsink name=WhisperSink emit-signals=true sync=false"
 
-    _pipeline_def_alt = "pulsesrc blocksize=3200 buffer-time=9223372036854775807 ! " \
+    _pipeline_def_alt = "pulsesrc name=stt_audio_src blocksize=3200 buffer-time=9223372036854775807 ! " \
                         "audio/x-raw,format=S16LE,rate=16000,channels=1 ! " \
                         "queue ! " \
                         "appsink name=WhisperSink emit-signals=true sync=false"
@@ -85,6 +85,15 @@ class STTGstWhisper(STTGstBase):
             return
 
         self._appsink.connect("new-sample", self._on_new_sample)
+
+        # Live mic level (peak-decay meter), surfaced to the IBus widget.
+        self._audio_level = 0.0
+
+        # Apply a saved capture device, if the user pinned one in the widget.
+        self._settings = Gio.Settings.new("org.freedesktop.ibus.engine.stt")
+        saved_device = self._settings.get_string("audio-device")
+        if saved_device:
+            self._apply_audio_device(saved_device)
 
         if current_locale is None:
             self._current_locale = stt_current_locale()
@@ -251,6 +260,11 @@ class STTGstWhisper(STTGstBase):
         buf.unmap(map_info)
 
         audio_float = audio_data.astype(np.float32) / 32768.0
+
+        if len(audio_float):
+            rms = float(np.sqrt(np.mean(audio_float ** 2)))
+            # Fast attack, slow release so the meter is readable at ~1 Hz.
+            self._audio_level = rms if rms > self._audio_level else self._audio_level * 0.8
 
         if self._vad is not None:
             was_in_speech = self._vad._in_speech
@@ -449,6 +463,80 @@ class STTGstWhisper(STTGstBase):
 
     def set_alternatives_num(self, num):
         pass
+
+    # --- Status surfaced to the IBus widget --------------------------------
+
+    def get_audio_level(self):
+        """Current mic level as a 0..1 RMS value (0 when not recording)."""
+        if not self.is_running():
+            return 0.0
+        return self._audio_level
+
+    def get_vad_status(self):
+        """(backend_name, in_speech). backend_name is '' if VAD is unavailable."""
+        if self._vad is None:
+            return ("", False)
+        return (self._vad.backend_name, bool(self._vad._in_speech))
+
+    def get_model_name(self):
+        """Friendly name of the loaded model, or its file basename, or None."""
+        if self._model is None:
+            return None
+        name = self._model.get_name()
+        if name:
+            return name
+        path = self._model.get_path()
+        return os.path.basename(path) if path else None
+
+    # --- Capture device selection ------------------------------------------
+
+    @staticmethod
+    def list_audio_sources():
+        """Return [(node_name, description), ...] for selectable input devices."""
+        sources = []
+        try:
+            monitor = Gst.DeviceMonitor.new()
+            monitor.add_filter("Audio/Source", None)
+            monitor.start()
+            for dev in monitor.get_devices() or []:
+                props = dev.get_properties()
+                node_name = props.get_string("node.name") if props else None
+                if not node_name or node_name.endswith(".monitor"):
+                    continue
+                desc = dev.get_display_name() or node_name
+                sources.append((node_name, desc))
+            monitor.stop()
+        except Exception as e:
+            LOG_MSG.warning("could not enumerate audio sources: %s", e)
+        return sources
+
+    def get_audio_device(self):
+        """Configured device node.name, or '' when following the system default."""
+        return self._settings.get_string("audio-device")
+
+    def set_audio_device(self, device):
+        device = device or ""
+        self._settings.set_string("audio-device", device)
+        self._apply_audio_device(device)
+
+    def _apply_audio_device(self, device):
+        if self.pipeline is None:
+            return
+        src = self.pipeline.get_by_name("stt_audio_src")
+        if src is None:
+            LOG_MSG.warning("no audio source element to set device on")
+            return
+
+        ret, state, pending = self.pipeline.get_state(0)
+        if state >= Gst.State.READY:
+            self.pipeline.set_state(Gst.State.READY)
+
+        # None tells pulsesrc to follow the system default source.
+        src.set_property("device", device if device else None)
+        LOG_MSG.info("audio capture device set to %s", device or "(system default)")
+
+        if state >= Gst.State.READY:
+            self.pipeline.set_state(state)
 
     def has_model(self):
         if self._model is None or self._model.available() is False:
