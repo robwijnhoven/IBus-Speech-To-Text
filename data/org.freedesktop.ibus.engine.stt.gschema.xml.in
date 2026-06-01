@@ -51,5 +51,10 @@
       <default>'None'</default>
       <description>A JSON formatted string that is used to associate locales with their Whisper models. It can be the name of a model if it is in default monitored paths or a custom path.</description>
     </key>
+    <key type="s" name="audio-device">
+      <summary>Capture device for speech recognition</summary>
+      <default>''</default>
+      <description>PipeWire/PulseAudio source name (node.name) of the microphone to capture from. An empty string means follow the system default source.</description>
+    </key>
   </schema>
 </schemalist>

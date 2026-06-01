@@ -44,6 +44,15 @@ __all__ = (
 GLib.set_prgname('ibus-engine-stt')
 
 LOG_MSG=logging.getLogger()
+# LED indicators shown at the right of the status lines in the IBus widget.
+_LED_GREEN  = "🟢"
+_LED_ORANGE = "🟠"
+_LED_RED    = "🔴"
+# Mic energy detection: an RMS level above this counts as "heard something".
+_ENERGY_THRESHOLD   = 0.01
+# Mic LED stays green for this many 1 Hz ticks after the last detected energy,
+# then turns orange. 10 ticks ~= 10 seconds.
+_ENERGY_GREEN_TICKS = 10
 
 class STTEngine(IBus.Engine):
     __gtype_name__ = 'STTEngine'
@@ -85,6 +94,26 @@ class STTEngine(IBus.Engine):
         self._preedit_text=self._settings.get_boolean("preedit-text")
         self._format_preedit=self._settings.get_boolean("format-preedit")
 
+        self._engine_connected=False
+        self._engine=stt_gst_factory_default().new_engine()
+        if self._engine.has_model() == False:
+            LOG_MSG.error("engine has no valid model")
+
+        # ~1 Hz refresh of the live status labels, only while recording.
+        self._status_timer_id=0
+        # (prop_key, node_name, label) for each microphone radio entry.
+        self._mic_entries=[]
+        # Cache of last-pushed status labels. The 1 Hz refresh only calls
+        # update_property when a label actually changed -- otherwise the open
+        # panel menu gets rebuilt and closes under the cursor.
+        self._last_labels={}
+        # Mic energy history driving the signal LED (reset each recording start).
+        self._energy_seen_ever=False
+        self._energy_idle_ticks=0
+        # While the panel popup is open we freeze status pushes, since any
+        # update_property rebuilds the popup and closes it under the cursor.
+        self._menu_visible=False
+
         self.__prop_list=IBus.PropList()
         self.__prop_list.append(IBus.Property(key="toggle-recording",
                                               label=_("Recognition off"),
@@ -116,12 +145,35 @@ class STTEngine(IBus.Engine):
                                               sensitive=False,
                                               sub_props=menu_prop_list))
 
+        self.__prop_list.append(IBus.Property(key="mic-menu",
+                                              label=_("Microphone"),
+                                              icon=None,
+                                              type=IBus.PropType.MENU,
+                                              sensitive=True,
+                                              sub_props=self._build_mic_prop_list()))
+
         self.__prop_list.append(IBus.Property(key="digit-mode",
                                               label=_("Use digits"),
                                               type=IBus.PropType.TOGGLE,
                                               state=IBus.PropState.UNCHECKED,
                                               sensitive=False,
                                               tooltip=_("Toggle the use of digits")))
+
+        self.__prop_list.append(IBus.Property(key="signal-status",
+                                              label=_("Microphone: off"),
+                                              type=IBus.PropType.NORMAL,
+                                              sensitive=False,
+                                              tooltip=_("Live microphone input level")))
+        self.__prop_list.append(IBus.Property(key="vad-status",
+                                              label=_("VAD: —"),
+                                              type=IBus.PropType.NORMAL,
+                                              sensitive=False,
+                                              tooltip=_("Voice activity detection status")))
+        self.__prop_list.append(IBus.Property(key="model-status",
+                                              label=_("Model: —"),
+                                              type=IBus.PropType.NORMAL,
+                                              sensitive=False,
+                                              tooltip=_("Active speech recognition model")))
 
         self.__prop_list.append(IBus.Property(key="configuration",
                                               label=_("Settings"),
@@ -133,11 +185,6 @@ class STTEngine(IBus.Engine):
                                               type=IBus.PropType.NORMAL,
                                               sensitive=True,
                                               tooltip=_("Learn more about IBus STT")))
-
-        self._engine_connected=False
-        self._engine=stt_gst_factory_default().new_engine()
-        if self._engine.has_model() == False:
-            LOG_MSG.error("engine has no valid model")
 
     def __del__(self):
         LOG_MSG.info("STTEngine destroyed %s", self)
@@ -171,6 +218,8 @@ class STTEngine(IBus.Engine):
     def do_destroy (self):
         # This method is inherited from IBusObject
         LOG_MSG.info("STTEngine destruction %s", self)
+
+        self._stop_status_timer()
 
         self._settings.disconnect_by_func(self._stop_on_key_pressed_changed)
         self._settings=None
@@ -262,6 +311,12 @@ class STTEngine(IBus.Engine):
                            tooltip=_("Toggle the use of digits"))
         self.update_property(prop)
 
+        if self._engine.is_running():
+            self._start_status_timer()
+        else:
+            self._stop_status_timer()
+        self._update_status_labels()
+
     def _state_changed(self, engine):
         # Be careful that we don't call this too often
         self._update_state()
@@ -275,6 +330,148 @@ class STTEngine(IBus.Engine):
 
     def _mode_changed(self, text_processor):
         self._update_state()
+
+    def _build_mic_prop_list(self):
+        # Radio submenu: "Follow system default" plus each detected input device.
+        # Only the Whisper backend exposes device selection.
+        if hasattr(self._engine, "list_audio_sources"):
+            sources = self._engine.list_audio_sources()
+            current = self._engine.get_audio_device()
+        else:
+            sources = []
+            current = ""
+
+        self._mic_entries = []
+        prop_list = IBus.PropList()
+
+        default_label = _("Follow system default")
+        prop_list.append(IBus.Property(key="mic-default",
+                                       label=default_label,
+                                       type=IBus.PropType.RADIO,
+                                       state=IBus.PropState.UNCHECKED if current else IBus.PropState.CHECKED,
+                                       tooltip=_("Use the system default input device")))
+        self._mic_entries.append(("mic-default", "", default_label))
+
+        for node_name, desc in sources:
+            key = "mic:" + node_name
+            prop_list.append(IBus.Property(key=key,
+                                           label=desc,
+                                           type=IBus.PropType.RADIO,
+                                           state=IBus.PropState.CHECKED if current == node_name else IBus.PropState.UNCHECKED,
+                                           tooltip=_("Capture speech from this device")))
+            self._mic_entries.append((key, node_name, desc))
+
+        return prop_list
+
+    def _update_mic_state(self, current):
+        for key, node, label in self._mic_entries:
+            checked = (node == current)
+            prop = IBus.Property(key=key,
+                                 label=IBus.Text(label),
+                                 type=IBus.PropType.RADIO,
+                                 state=IBus.PropState.CHECKED if checked else IBus.PropState.UNCHECKED)
+            self.update_property(prop)
+
+    def _format_signal(self, level, running):
+        # Fixed-width output (10-cell bar + 7-char field) so the trailing LED
+        # never shifts horizontally, and so a resting mic produces a byte-stable
+        # string that the cache can suppress (keeping the menu open).
+        width = 10
+        if not running:
+            bar = "─" * width
+            field = _("off")
+        elif level < _ENERGY_THRESHOLD:
+            bar = "░" * width
+            field = _("silent")
+        else:
+            import math
+            db = 20.0 * math.log10(min(1.0, level))
+            frac = max(0.0, min(1.0, (db + 60.0) / 60.0))
+            filled = int(round(frac * width))
+            bar = "█" * filled + "░" * (width - filled)
+            field = "%4.0f dB" % db
+        return "🎤 %s %-7s" % (bar, field)
+
+    def _set_label(self, key, label):
+        # Only push when the text changed, so an idle widget keeps the menu open.
+        if self._last_labels.get(key) == label:
+            return
+        self._last_labels[key] = label
+        LOG_MSG.debug("widget push %s = %r", key, label)
+        self.update_property(IBus.Property(key=key,
+                                           label=IBus.Text(label),
+                                           type=IBus.PropType.NORMAL,
+                                           sensitive=False))
+
+    def _update_status_labels(self):
+        running = self._engine.is_running()
+        run_led = _LED_GREEN if running else _LED_RED
+
+        # Microphone signal + energy-history LED.
+        level = self._engine.get_audio_level() if hasattr(self._engine, "get_audio_level") else 0.0
+        if running:
+            if level > _ENERGY_THRESHOLD:
+                self._energy_idle_ticks = 0
+                self._energy_seen_ever = True
+            else:
+                self._energy_idle_ticks += 1
+
+        if not running or not self._energy_seen_ever:
+            mic_led = _LED_RED
+        elif self._energy_idle_ticks <= _ENERGY_GREEN_TICKS:
+            mic_led = _LED_GREEN
+        else:
+            mic_led = _LED_ORANGE
+        self._set_label("signal-status",
+                        "%s  %s" % (mic_led, self._format_signal(level, running)))
+
+        # VAD status.
+        if hasattr(self._engine, "get_vad_status"):
+            backend, in_speech = self._engine.get_vad_status()
+        else:
+            backend, in_speech = ("", False)
+        if backend:
+            state = _("speaking") if (running and in_speech) else _("idle")
+            vad_text = "%s · %-8s" % (backend, state)
+        else:
+            vad_text = _("VAD: unavailable")
+        self._set_label("vad-status", "%s  %s" % (run_led, vad_text))
+
+        # Active model.
+        name = self._engine.get_model_name() if hasattr(self._engine, "get_model_name") else None
+        model_text = _("Model: %s") % (name if name else _("none"))
+        self._set_label("model-status", "%s  %s" % (run_led, model_text))
+
+    def _on_status_tick(self):
+        if not self._engine.is_running():
+            self._status_timer_id = 0
+            self._update_status_labels()
+            return False
+        # Freeze pushes while the panel popup is open, otherwise each
+        # update_property rebuilds it and closes it under the cursor.
+        if not self._menu_visible:
+            self._update_status_labels()
+        return True
+
+    def do_property_show(self, prop_name):
+        LOG_MSG.debug("property show %s", prop_name)
+        self._menu_visible = True
+
+    def do_property_hide(self, prop_name):
+        LOG_MSG.debug("property hide %s", prop_name)
+        self._menu_visible = False
+
+    def _start_status_timer(self):
+        if self._status_timer_id == 0:
+            # Fresh recording session: restart the mic energy history.
+            self._energy_seen_ever = False
+            self._energy_idle_ticks = 0
+            self._status_timer_id = GLib.timeout_add(1000, self._on_status_tick)
+
+    def _stop_status_timer(self):
+        if self._status_timer_id != 0:
+            GLib.source_remove(self._status_timer_id)
+            self._status_timer_id = 0
 
     def do_enable(self):
         LOG_MSG.info('enable %s', self)
@@ -311,6 +508,8 @@ class STTEngine(IBus.Engine):
 
     def do_focus_in_id(self, object_path, client):
         LOG_MSG.debug("focus in id %s %s", object_path, client)
+        # Safety: never stay frozen if a property-hide was missed.
+        self._menu_visible = False
         # FIXME: hopefully ibus 1.5.28 will have property needs_surrounding_text
         (ibus_text, cursor_pos, anchor_pos)=self.get_surrounding_text()
         self.register_properties(self.__prop_list)
@@ -343,6 +542,7 @@ class STTEngine(IBus.Engine):
     def do_property_activate(self, prop_name, state):
         # Reminder: no need to call final_results() since do_reset()
         # do_focus_out() is called.
+        self._menu_visible = False
 
         if prop_name == 'toggle-recording':
             # State will be updated by the engine
@@ -361,6 +561,11 @@ class STTEngine(IBus.Engine):
                 self._text_processor.mode = STTParseModes.LITERAL
         elif prop_name == 'digit-mode':
             self._text_processor.use_digits = bool(state)
+        elif prop_name == 'mic-default' or prop_name.startswith('mic:'):
+            if bool(state) == True and hasattr(self._engine, 'set_audio_device'):
+                device = "" if prop_name == 'mic-default' else prop_name[len('mic:'):]
+                self._engine.set_audio_device(device)
+                self._update_mic_state(device)
         elif prop_name == 'configuration':
             subprocess.Popen([os.path.join(stt_utils_get_libexec(), "ibus-setup-stt")])
         elif prop_name == 'about':
