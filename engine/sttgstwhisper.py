@@ -132,6 +132,10 @@ class STTGstWhisper(STTGstBase):
         self._use_partial_results = False
         self._partial_timer_id = 0
         self._last_partial_samples = 0
+        # Whether to actually transcribe. The pipeline keeps capturing (so the
+        # mic meter stays live) whenever the engine is enabled; this flag gates
+        # the VAD/Whisper path so "recognition off" means "monitoring only".
+        self._recognizing = False
 
     def __del__(self):
         LOG_MSG.info("Whisper __del__")
@@ -265,6 +269,10 @@ class STTGstWhisper(STTGstBase):
             rms = float(np.sqrt(np.mean(audio_float ** 2)))
             # Fast attack, slow release so the meter is readable at ~1 Hz.
             self._audio_level = rms if rms > self._audio_level else self._audio_level * 0.8
+
+        # Capture always runs (for the meter); only transcribe when recognising.
+        if not self._recognizing:
+            return Gst.FlowReturn.OK
 
         if self._vad is not None:
             was_in_speech = self._vad._in_speech
@@ -464,6 +472,28 @@ class STTGstWhisper(STTGstBase):
     def set_alternatives_num(self, num):
         pass
 
+    def is_recognizing(self):
+        """Whether speech is being transcribed (distinct from capturing)."""
+        return self._recognizing
+
+    def set_recognizing(self, active):
+        active = bool(active)
+        if active == self._recognizing:
+            return
+        self._recognizing = active
+        if active:
+            LOG_MSG.info("recognition on")
+        else:
+            # Turning off: flush any in-progress speech to a final result, then
+            # reset transcription state so nothing leaks while monitoring only.
+            LOG_MSG.info("recognition off")
+            self._stop_partial_timer()
+            self.get_final_results()
+            if self._vad is not None:
+                self._vad._in_speech = False
+            self._chunk_buffer.clear()
+            self._chunk_samples = 0
+
     # --- Status surfaced to the IBus widget --------------------------------
 
     def get_audio_level(self):
@@ -476,7 +506,7 @@ class STTGstWhisper(STTGstBase):
         """(backend_name, in_speech). backend_name is '' if VAD is unavailable."""
         if self._vad is None:
             return ("", False)
-        return (self._vad.backend_name, bool(self._vad._in_speech))
+        return (self._vad.backend_name, bool(self._recognizing and self._vad._in_speech))
 
     def get_model_name(self):
         """Friendly name of the loaded model, or its file basename, or None."""
