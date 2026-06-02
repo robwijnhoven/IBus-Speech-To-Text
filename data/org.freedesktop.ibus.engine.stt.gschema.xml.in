@@ -2,7 +2,7 @@
 <schemalist>
   <schema id="org.freedesktop.ibus.engine.stt" path="/org/freedesktop/ibus/engine/stt/">
     <key name="active-on-start" type="b">
-      <default>false</default>
+      <default>true</default>
       <summary>Start voice recognition as soon as the engine is enabled</summary>
       <description>Start voice recognition as soon as the engine is enabled.</description>
     </key>

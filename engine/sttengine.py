@@ -251,8 +251,24 @@ class STTEngine(IBus.Engine):
     def _on_format_preedit_changed(self, settings, key):
         self._format_preedit=self._settings.get_boolean("format-preedit")
 
+    def _is_recognizing(self):
+        # The mic keeps capturing (for the live meter) whenever the engine is
+        # enabled; "recognising" is the separate transcription state shown on
+        # the toggle. Fall back to is_running() for backends without the split.
+        if hasattr(self._engine, "is_recognizing"):
+            return self._engine.is_recognizing()
+        return self._engine.is_running()
+
+    def _set_recognizing(self, active):
+        if hasattr(self._engine, "set_recognizing"):
+            self._engine.set_recognizing(active)
+        elif active:
+            self._engine.run()
+        else:
+            self._engine.stop()
+
     def _update_state(self):
-        if self._engine.is_running() == True:
+        if self._is_recognizing() == True:
             button_state=IBus.PropState.CHECKED
             button_label=IBus.Text(_("Recognition on"))
         else:
@@ -504,9 +520,11 @@ class STTEngine(IBus.Engine):
 
         active_on_start = self._settings.get_boolean("active-on-start")
         LOG_MSG.info("engine enabled %s (active_on_start=%s)", self, active_on_start)
-        if active_on_start == True:
-            self._engine.run()
-            self._update_state()
+        # Start capturing immediately so the mic meter is live; recognition
+        # (transcription) follows the active-on-start preference.
+        self._engine.run()
+        self._set_recognizing(active_on_start == True)
+        self._update_state()
 
     def do_disable(self):
         LOG_MSG.info('disable %s', self)
@@ -556,11 +574,9 @@ class STTEngine(IBus.Engine):
         self._menu_visible = False
 
         if prop_name == 'toggle-recording':
-            # State will be updated by the engine
-            if bool(state) == True:
-                self._engine.run()
-            else:
-                self._engine.stop()
+            # Toggle transcription only; the mic keeps capturing for the meter.
+            self._set_recognizing(bool(state) == True)
+            self._update_state()
         elif prop_name == 'dictation-mode':
             if state == True:
                 self._text_processor.mode = STTParseModes.DICTATION
@@ -684,7 +700,8 @@ class STTEngine(IBus.Engine):
     def do_process_key_event(self, keyval, keycode, state):
         if (state & IBus.ModifierType.RELEASE_MASK) != 0:
             if self._stop_on_key_pressed == True:
-                self._engine.stop()
+                # Stop transcribing on keypress, but keep capturing (meter live).
+                self._set_recognizing(False)
                 self._update_state()
         else:
             # Any keystroke should stop a potential ongoing processing
