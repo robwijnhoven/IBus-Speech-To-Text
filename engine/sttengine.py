@@ -662,10 +662,15 @@ class STTEngine(IBus.Engine):
             paste_text = utterance.lstrip(' ')
             if paste_text != utterance:
                 paste_text = paste_text + ' '
+            # Keep consecutive sentences from gluing together: a sentence that
+            # ends with terminal punctuation gets a trailing space so the next
+            # utterance pastes cleanly ("Hello.World." -> "Hello. World.").
+            if paste_text and paste_text[-1] in '.?!':
+                paste_text = paste_text + ' '
             subprocess.run(["xclip", "-selection", "clipboard"],
                            input=paste_text.encode("utf-8"), timeout=2)
             subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"], timeout=2)
-            self._left_text+=utterance
+            self._left_text+=paste_text
             self._left_text_reset=False
             LOG_MSG.debug("current left text (after commit) (%s)", self._left_text)
 
