@@ -45,13 +45,73 @@ WINDOW_SECONDS      = 5.0
 MIN_SAMPLES         = 1024
 SAMPLE_RATE         = 16000
 AUDIO_CTX           = 768
-TEMPERATURE_INC     = -1.0
+# 0.2 is the whisper.cpp default. A value <= 0 disables temperature fallback,
+# which is whisper's ONLY built-in escape from greedy-decoding repetition loops
+# (the "same phrase pasted 15-50x" bug). The entropy/logprob thresholds below
+# only DETECT a degenerate decode; fallback to a higher temperature is what
+# actually breaks the loop. Keep this strictly positive.
+TEMPERATURE_INC     = 0.2
 MAX_TOKENS          = 256
 _cpu_count = os.cpu_count() or 1
 N_THREADS           = max(4, _cpu_count // 2 )
 MAX_RING_QUEUE_DEPTH = 2
 PARTIAL_INTERVAL_S  = 1.0
 MIN_SEGMENT_PROB    = 0.35
+# Output guard against runaway repetition loops that slip past whisper's own
+# fallback. A phrase repeated more than this many times in a row is trimmed
+# back to this many copies. Raise if it ever clips legitimate speech.
+MAX_PHRASE_REPEAT   = 2
+
+
+def _collapse_repetitions(text, keep=MAX_PHRASE_REPEAT, max_ngram=10):
+    """Trim runaway Whisper repetition loops.
+
+    A phrase of up to ``max_ngram`` words that repeats more than ``keep`` times
+    in a row is reduced to ``keep`` copies. Words are compared
+    case-insensitively and ignoring surrounding punctuation, but the original
+    tokens are preserved in the output. Ordinary short repeats survive.
+    """
+    words = text.split()
+    n_words = len(words)
+    if n_words <= keep:
+        return text
+
+    def _norm(w):
+        return w.strip(".,!?;:…—-").lower()
+
+    keys = [_norm(w) for w in words]
+    out = []
+    i = 0
+    collapsed_any = False
+    while i < n_words:
+        matched = False
+        # Try the shortest phrase first: a single-word run ("hi hi hi ...")
+        # collapses to one word, while a phrase-level loop ("the cat sat
+        # the cat sat ...") falls through to the n that actually repeats.
+        upper = min(max_ngram, (n_words - i) // 2)
+        for n in range(1, upper + 1):
+            gram = keys[i:i + n]
+            reps = 1
+            j = i + n
+            while j + n <= n_words and keys[j:j + n] == gram:
+                reps += 1
+                j += n
+            if reps > keep:
+                out.extend(words[i:i + n * keep])
+                i = j
+                matched = True
+                collapsed_any = True
+                break
+        if not matched:
+            out.append(words[i])
+            i += 1
+
+    if collapsed_any:
+        LOG_MSG.warning("Collapsed repetition loop: %d words -> %d words",
+                        n_words, len(out))
+        return ' '.join(out)
+    return text
+
 
 class STTGstWhisper(STTGstBase):
     __gtype_name__ = 'STTGstWhisper'
@@ -398,6 +458,7 @@ class STTGstWhisper(STTGstBase):
                                       segment_text, prob)
 
                 text = ' '.join(text_parts).strip()
+                text = _collapse_repetitions(text)
 
                 if text and text.lower() not in _HALLUCINATIONS:
                     if source == 'partial':
