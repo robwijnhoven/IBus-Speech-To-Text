@@ -28,6 +28,44 @@ _HALLUCINATIONS = {
     "yeah.", "yeah", "yep.", "yep",
 }
 
+def _collapse_repetitions(text: str) -> str:
+    """Collapse whisper.cpp in-segment repetition loops.
+
+    The decoder sometimes re-emits the same span within a single segment, e.g.
+    "... right? ... right? ... right?" or a whole sentence typed back-to-back.
+    The temperature fallback catches most, but looping text has low entropy so
+    some slip through. This is a deterministic safety net applied to the final
+    text only (never partials, which are expected to grow).
+
+    Two passes:
+      1. Whole-string halving: if the text is exactly its first half repeated
+         (allowing trailing whitespace/punctuation), keep one copy.
+      2. Adjacent-sentence dedup: drop a sentence that is identical to the one
+         immediately before it (case/space-insensitive).
+    """
+    if not text:
+        return text
+
+    # Pass 1: exact doubling of the entire string (the most common loop).
+    stripped = text.strip()
+    n = len(stripped)
+    if n >= 2:
+        half = n // 2
+        first, second = stripped[:half].strip(), stripped[half:].strip()
+        if first and first == second:
+            return first
+
+    # Pass 2: collapse consecutive identical sentences.
+    sentences = re.split(r'(?<=[.?!])\s+', text.strip())
+    out = []
+    for s in sentences:
+        key = s.strip().lower()
+        if out and key and key == out[-1].strip().lower():
+            continue
+        out.append(s)
+    return ' '.join(out)
+
+
 try:
     from pywhispercpp.model import Model
     WHISPER_AVAILABLE = True
@@ -45,13 +83,28 @@ WINDOW_SECONDS      = 5.0
 MIN_SAMPLES         = 1024
 SAMPLE_RATE         = 16000
 AUDIO_CTX           = 768
-TEMPERATURE_INC     = -1.0
+# Temperature fallback step. A negative value DISABLES fallback, which means a
+# segment that trips entropy_thold (repetition loop) is never re-decoded, so
+# Whisper emits duplicated text on longer utterances. 0.2 is whisper.cpp's
+# default and lets it retry at higher temperature to break the loop.
+TEMPERATURE_INC     = 0.2
 MAX_TOKENS          = 256
 _cpu_count = os.cpu_count() or 1
 N_THREADS           = max(4, _cpu_count // 2 )
 MAX_RING_QUEUE_DEPTH = 2
-PARTIAL_INTERVAL_S  = 1.0
+# 0.5s (was 1.0): with silence_duration_ms=400, a 1s partial cadence often left
+# the last partial >0.4s behind the segment close, so promotion missed and we
+# paid a full decode. Ticking every 0.5s keeps the last partial within the
+# promotion tail window so finalize stays decode-free.
+PARTIAL_INTERVAL_S  = 0.5
 MIN_SEGMENT_PROB    = 0.35
+# Option 1: promote the last partial as the final result (skip the redundant
+# full re-decode) when that partial already covered at least this fraction of
+# the finalized segment AND the uncovered tail is shorter than
+# PROMOTE_MAX_TAIL_S. Otherwise fall back to a full decode so trailing words
+# spoken just before the pause are never dropped.
+PROMOTE_MIN_COVERAGE = 0.90
+PROMOTE_MAX_TAIL_S   = 0.6
 
 class STTGstWhisper(STTGstBase):
     __gtype_name__ = 'STTGstWhisper'
@@ -115,10 +168,17 @@ class STTGstWhisper(STTGstBase):
         if VAD_MODULE_OK:
             self._vad = STTVad(
                 speech_threshold=0.5,
-                silence_duration_ms=800,
+                # Lowered 800 -> 300: dominant tail latency now that the final
+                # decode is skipped/cheap. Measured GPU decode is ~90-200ms, so
+                # this silence window is what the user feels. 300ms still
+                # distinguishes an end-of-utterance pause from inter-word gaps.
+                silence_duration_ms=300,
                 speech_pad_ms=200,
                 min_speech_duration_ms=300,
-                max_speech_duration_s=15.0,
+                # Raised 15 -> 30: a long uninterrupted sentence used to be
+                # force-cut mid-thought at 15s. Decode is ~75x realtime on this
+                # GPU (30s -> ~400ms), so the larger cap costs little.
+                max_speech_duration_s=30.0,
                 freq_thold=100.0,
             )
             LOG_MSG.info("VAD active: %s", self._vad.backend_name)
@@ -132,6 +192,15 @@ class STTGstWhisper(STTGstBase):
         self._use_partial_results = False
         self._partial_timer_id = 0
         self._last_partial_samples = 0
+        # Option 1 ("promote last partial"): the most recent partial decode's
+        # text and the sample count it was decoded from. When a segment
+        # finalizes and the last partial already covered nearly all of it, we
+        # emit the partial as the final result and skip the redundant
+        # full-segment re-decode. Guarded by _partial_lock since the worker
+        # thread writes these and the (GLib main-thread) finalize path reads.
+        self._last_partial_text = None
+        self._last_partial_text_samples = 0
+        self._partial_lock = threading.Lock()
 
     def __del__(self):
         LOG_MSG.info("Whisper __del__")
@@ -184,9 +253,13 @@ class STTGstWhisper(STTGstBase):
                 temperature_inc=TEMPERATURE_INC,
                 max_tokens=MAX_TOKENS,
                 n_threads=N_THREADS,
-                no_speech_thold=0.5,
+                # Raised from 0.5/2.4 so a looping/low-quality decode trips the
+                # temperature fallback (re-decode at higher temp) more readily.
+                # Repetition loops have LOW entropy, so they slip past a tight
+                # entropy_thold; a higher value catches more of them.
+                no_speech_thold=0.6,
                 logprob_thold=-1.0,
-                entropy_thold=2.4,
+                entropy_thold=2.8,
                 suppress_blank=True,
             )
 
@@ -352,6 +425,40 @@ class STTGstWhisper(STTGstBase):
             self._process_thread = threading.Thread(target=self._process_worker, daemon=True)
             self._process_thread.start()
 
+    def _maybe_promote_partial(self, partial_text, partial_samples,
+                               segment_samples):
+        """Return the partial text to use as the final result, or None to fall
+        back to a full decode.
+
+        Promote only when a recent partial covered nearly the whole segment
+        (>= PROMOTE_MIN_COVERAGE) and the uncovered tail is shorter than
+        PROMOTE_MAX_TAIL_S, so trailing words spoken just before the pause are
+        never lost. Worst case (no usable partial) is identical to the old
+        always-decode behaviour.
+        """
+        if not partial_text or partial_samples <= 0 or segment_samples <= 0:
+            return None
+
+        # The partial may have been decoded from slightly more or fewer samples
+        # than the final segment (padding, leftover). Coverage is how much of
+        # the segment the partial already saw; tail is what it missed.
+        coverage = min(partial_samples, segment_samples) / segment_samples
+        tail_samples = max(0, segment_samples - partial_samples)
+        tail_s = tail_samples / SAMPLE_RATE
+
+        if coverage < PROMOTE_MIN_COVERAGE or tail_s > PROMOTE_MAX_TAIL_S:
+            LOG_MSG.debug("Not promoting partial (coverage=%.2f, tail=%.2fs) "
+                          "-- full decode", coverage, tail_s)
+            return None
+
+        # Apply the same content filters a decoded final would get.
+        text = _collapse_repetitions(partial_text.strip())
+        if not text or text.lower() in _HALLUCINATIONS:
+            return None
+        if SPECIAL_PATTERN.match(text):
+            return None
+        return text
+
     def _process_worker(self):
         """Background worker to process audio"""
         while not self._stop_processing:
@@ -363,6 +470,28 @@ class STTGstWhisper(STTGstBase):
             if self._whisper is None:
                 self._process_queue.task_done()
                 continue
+
+            # Option 1: on a finalize, try to promote the last partial instead
+            # of re-decoding the whole segment. Partials are consumed (reset)
+            # on every finalize so a stale one can't be reused next utterance.
+            if source != 'partial':
+                with self._partial_lock:
+                    partial_text = self._last_partial_text
+                    partial_samples = self._last_partial_text_samples
+                    self._last_partial_text = None
+                    self._last_partial_text_samples = 0
+
+                promoted = self._maybe_promote_partial(
+                    partial_text, partial_samples, len(audio))
+                if promoted is not None:
+                    LOG_MSG.info("Promoted last partial as final (skipped "
+                                 "re-decode): '%s'", promoted)
+                    text = promoted
+                    if text[-1] not in '.?!':
+                        text += '.'
+                    GLib.idle_add(self._emit_text, text)
+                    self._process_queue.task_done()
+                    continue
 
             try:
                 LOG_MSG.debug("Starting transcription of %d samples", len(audio))
@@ -394,8 +523,18 @@ class STTGstWhisper(STTGstBase):
                 if text and text.lower() not in _HALLUCINATIONS:
                     if source == 'partial':
                         LOG_MSG.debug("Partial transcription: '%s'", text)
+                        # Remember this partial so a subsequent finalize can
+                        # promote it instead of re-decoding (option 1).
+                        with self._partial_lock:
+                            self._last_partial_text = text
+                            self._last_partial_text_samples = len(audio)
                         GLib.idle_add(self._emit_partial_text, text)
                     else:
+                        deduped = _collapse_repetitions(text)
+                        if deduped != text:
+                            LOG_MSG.info("Collapsed repetition: '%s' -> '%s'",
+                                         text, deduped)
+                            text = deduped
                         if text and text[-1] not in '.?!':
                             text += '.'
                         LOG_MSG.info("Whisper transcription result: '%s'", text)
@@ -414,6 +553,11 @@ class STTGstWhisper(STTGstBase):
 
     def _start_partial_timer(self):
         self._last_partial_samples = 0
+        # New speech run: drop any partial captured in a previous run so it can
+        # never be promoted onto this utterance's segment.
+        with self._partial_lock:
+            self._last_partial_text = None
+            self._last_partial_text_samples = 0
         self._partial_timer_id = GLib.timeout_add(
             int(PARTIAL_INTERVAL_S * 1000), self._on_partial_tick)
 

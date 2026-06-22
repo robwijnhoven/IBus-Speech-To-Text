@@ -148,9 +148,10 @@ class IMApplication(Adw.Application):
 if __name__ == "__main__":
     LOG_MSG=logging.getLogger()
     msg_handler=logging.StreamHandler()
-    msg_formatter=logging.Formatter('%(levelname)s: \t'
+    msg_formatter=logging.Formatter('%(asctime)s.%(msecs)03d %(levelname)s: \t'
                                     '%(filename)s:%(lineno)d:%(funcName)s: \t'
-                                    '%(message)s')
+                                    '%(message)s',
+                                    datefmt='%H:%M:%S')
     msg_handler.setFormatter(msg_formatter)
     LOG_MSG.addHandler(msg_handler)
     LOG_MSG.setLevel(logging.INFO)
