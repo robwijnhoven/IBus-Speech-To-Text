@@ -91,7 +91,7 @@ class _EnergyClassifier:
 
 
 _SILERO_MODEL_PATHS = [
-    "~/sst/models/silero_vad.onnx",
+    "/opt/ibus-stt/models/silero_vad.onnx",
     "/usr/share/ibus-stt/models/silero_vad.onnx",
 ]
 

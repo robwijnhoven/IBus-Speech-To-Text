@@ -54,6 +54,22 @@ _ENERGY_THRESHOLD   = 0.01
 # then turns orange. 10 ticks ~= 10 seconds.
 _ENERGY_GREEN_TICKS = 10
 
+# On the US-International (us+intl) keyboard layout these chars are dead keys:
+# typed alone they wait to compose with the next character (' + m -> ḿ). Since
+# we inject text with `ydotool type`, which goes through the active layout, we
+# follow each dead-key char with a space. The us-intl compose engine consumes
+# that space and emits the literal symbol, so "I'm" types as "I'm" not "Iḿ".
+# (Verified: typing "A' B" yields "A'B".)
+_US_INTL_DEAD_KEYS = "'\"`~^"
+
+def _escape_dead_keys(text):
+    out = []
+    for ch in text:
+        out.append(ch)
+        if ch in _US_INTL_DEAD_KEYS:
+            out.append(' ')
+    return ''.join(out)
+
 class STTEngine(IBus.Engine):
     __gtype_name__ = 'STTEngine'
 
@@ -635,9 +651,30 @@ class STTEngine(IBus.Engine):
             paste_text = utterance.lstrip(' ')
             if paste_text != utterance:
                 paste_text = paste_text + ' '
-            subprocess.run(["wl-copy", "--", paste_text], timeout=2)
-            subprocess.run(["ydotool", "key", "ctrl+v"], timeout=2)
-            self._left_text+=utterance
+            # Separate sentences: if this segment ends a sentence, append a
+            # space so the next dictated segment doesn't glue onto it.
+            if paste_text and paste_text[-1] in ".?!" :
+                paste_text = paste_text + ' '
+            # Type the text directly instead of clipboard paste. ctrl+v is
+            # paste in GUI apps but "quoted insert" in terminals, so a
+            # clipboard+ctrl+v approach silently fails (and clears preedit) in
+            # the terminal. wtype is not an option here: GNOME's compositor
+            # does not implement the virtual-keyboard Wayland protocol.
+            #
+            # ydotool type works (it injects via the kernel uinput layer), but
+            # it goes *through* the active keyboard layout. On us-intl, the
+            # chars ' " ` ~ ^ are DEAD keys that compose with the next char
+            # (so "I'm" -> "Iḿ"). The us-intl way to get a literal dead-key
+            # char is to follow it with a space, which the compose engine
+            # consumes while emitting just the symbol. So insert that space.
+            typed_text = _escape_dead_keys(paste_text)
+            subprocess.run(["ydotool", "type", "--file", "-"],
+                           input=typed_text.encode("utf-8"), timeout=10)
+            # Track what we actually typed (paste_text, incl. any trailing
+            # sentence space) so _left_text matches the real surrounding text.
+            # Note: _escape_dead_keys spaces are consumed by the compose engine
+            # and do not appear in the text, so use paste_text, not typed_text.
+            self._left_text+=paste_text
             self._left_text_reset=False
             LOG_MSG.debug("current left text (after commit) (%s)", self._left_text)
 
