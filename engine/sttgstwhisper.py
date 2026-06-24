@@ -168,11 +168,12 @@ class STTGstWhisper(STTGstBase):
         if VAD_MODULE_OK:
             self._vad = STTVad(
                 speech_threshold=0.5,
-                # Lowered 800 -> 300: dominant tail latency now that the final
-                # decode is skipped/cheap. Measured GPU decode is ~90-200ms, so
-                # this silence window is what the user feels. 300ms still
-                # distinguishes an end-of-utterance pause from inter-word gaps.
-                silence_duration_ms=300,
+                # 800ms: the user's chosen optimum between snappy finalize and
+                # stitching short mid-thought pauses. This silence window is the
+                # only felt delay now that injection is instant (ydotoold +
+                # zeroed ydotool key-delay/key-hold). Was 300 -> 1200 -> 1000 ->
+                # 800.
+                silence_duration_ms=800,
                 speech_pad_ms=200,
                 min_speech_duration_ms=300,
                 # Raised 15 -> 30: a long uninterrupted sentence used to be

@@ -668,7 +668,24 @@ class STTEngine(IBus.Engine):
             # char is to follow it with a space, which the compose engine
             # consumes while emitting just the symbol. So insert that space.
             typed_text = _escape_dead_keys(paste_text)
-            subprocess.run(["ydotool", "type", "--file", "-"],
+            # ydotool inserts a per-key delay AND holds each key, both 20ms by
+            # default on the daemon-backed 1.x client (12ms on the old 0.1.8
+            # fallback client). For a long sentence that is 1-2s of visible
+            # typing animation the user perceives as the system being "slow" --
+            # it is unrelated to GPU decode (~70-200ms). Zeroing both makes the
+            # whole utterance land as fast as the uinput layer allows.
+            #
+            # Requires the ydotoold user daemon (see scripts/install-ydotoold.sh
+            # + the ydotoold.service user unit); without it ydotool falls back
+            # to a slow per-call path and prints "backend unavailable". On X11
+            # machines xdotool/XTEST is used instead and has neither problem --
+            # that is why an X11 laptop feels instant by comparison.
+            #
+            # NOTE: with --file - (stdin) the 1.x client disables its own escape
+            # processing by default, so _escape_dead_keys() remains the single
+            # source of truth for dead-key handling.
+            subprocess.run(["ydotool", "type", "--key-delay", "0",
+                            "--key-hold", "0", "--file", "-"],
                            input=typed_text.encode("utf-8"), timeout=10)
             # Track what we actually typed (paste_text, incl. any trailing
             # sentence space) so _left_text matches the real surrounding text.

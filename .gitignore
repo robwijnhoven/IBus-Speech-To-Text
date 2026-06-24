@@ -4,3 +4,6 @@ __pycache__/
 
 # Meson build directory
 /builddir/
+
+# MemSearch plugin data (not project code)
+.memsearch/
