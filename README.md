@@ -66,3 +66,13 @@ Activate the Input Method through the IBus menu (that depends on your desktop) a
 It might seem obvious but the quality of the microphone used largely influences the accuracy of the voice recognition.
 
 This Input Method can also be enabled and disabled with the default shorcut ("Win + Space") used to switch between IBus Input Methods. By default, when IBus STT is enabled, voice recognition is not started immediately but there is a setting to change this behaviour. If enabled, you can start and stop voice recognition with the above shortcut.
+
+TODO / Notes
+============
+
+- The clipboard + paste backend is currently hardcoded (this branch uses
+  `xclip` + `xdotool`; upstream uses `wl-copy` + `ydotool`). It should instead
+  auto-detect the session type at runtime and pick the right tools — `wl-copy` +
+  `ydotool` on Wayland, `xclip` + `xdotool` on X11 — e.g. by checking
+  `XDG_SESSION_TYPE` / `WAYLAND_DISPLAY`. See the paste logic in
+  `engine/sttengine.py` (`_commit_text` / utterance commit). Fix next time.

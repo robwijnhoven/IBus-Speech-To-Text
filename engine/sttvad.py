@@ -1,4 +1,5 @@
 import logging
+import os
 import numpy as np
 from collections import deque
 
@@ -90,17 +91,38 @@ class _EnergyClassifier:
         return (energy_low / energy_total) < self._low_energy_ratio
 
 
-_SILERO_MODEL_PATHS = [
-    "/opt/ibus-stt/models/silero_vad.onnx",
-    "/usr/share/ibus-stt/models/silero_vad.onnx",
-]
+_SILERO_MODEL_FILENAME = "silero_vad.onnx"
+
+
+def _silero_model_candidates() -> list[str]:
+    """Search locations for the Silero VAD model, most specific first.
+
+    No machine-specific paths are hardcoded: an explicit env override wins,
+    otherwise the model is resolved from the relocated /opt runtime dir (this
+    machine's deps live there so a project move can't break the engine -- see
+    CLAUDE.md), then from the install data dir via sttutils (the same mechanism
+    the rest of the engine uses for bundled data, e.g.
+    /usr/share/ibus-stt/models/silero_vad.onnx).
+    """
+    candidates = []
+    env = os.environ.get("STT_SILERO_VAD_MODEL")
+    if env:
+        candidates.append(env)
+    candidates.append("/opt/ibus-stt/models/" + _SILERO_MODEL_FILENAME)
+    try:
+        from sttutils import stt_utils_get_system_data_path
+        candidates.append(os.path.join(stt_utils_get_system_data_path(),
+                                       "models", _SILERO_MODEL_FILENAME))
+    except Exception as e:
+        LOG_MSG.debug("sttutils datadir unavailable for Silero lookup: %s", e)
+    return candidates
 
 
 def _find_silero_model() -> str | None:
-    import os
-    for p in _SILERO_MODEL_PATHS:
-        if os.path.isfile(p):
-            return p
+    for path in _silero_model_candidates():
+        if path and os.path.isfile(path):
+            LOG_MSG.debug("Silero VAD model found at %s", path)
+            return path
     return None
 
 

@@ -28,43 +28,6 @@ _HALLUCINATIONS = {
     "yeah.", "yeah", "yep.", "yep",
 }
 
-def _collapse_repetitions(text: str) -> str:
-    """Collapse whisper.cpp in-segment repetition loops.
-
-    The decoder sometimes re-emits the same span within a single segment, e.g.
-    "... right? ... right? ... right?" or a whole sentence typed back-to-back.
-    The temperature fallback catches most, but looping text has low entropy so
-    some slip through. This is a deterministic safety net applied to the final
-    text only (never partials, which are expected to grow).
-
-    Two passes:
-      1. Whole-string halving: if the text is exactly its first half repeated
-         (allowing trailing whitespace/punctuation), keep one copy.
-      2. Adjacent-sentence dedup: drop a sentence that is identical to the one
-         immediately before it (case/space-insensitive).
-    """
-    if not text:
-        return text
-
-    # Pass 1: exact doubling of the entire string (the most common loop).
-    stripped = text.strip()
-    n = len(stripped)
-    if n >= 2:
-        half = n // 2
-        first, second = stripped[:half].strip(), stripped[half:].strip()
-        if first and first == second:
-            return first
-
-    # Pass 2: collapse consecutive identical sentences.
-    sentences = re.split(r'(?<=[.?!])\s+', text.strip())
-    out = []
-    for s in sentences:
-        key = s.strip().lower()
-        if out and key and key == out[-1].strip().lower():
-            continue
-        out.append(s)
-    return ' '.join(out)
-
 
 try:
     from pywhispercpp.model import Model
@@ -83,10 +46,11 @@ WINDOW_SECONDS      = 5.0
 MIN_SAMPLES         = 1024
 SAMPLE_RATE         = 16000
 AUDIO_CTX           = 768
-# Temperature fallback step. A negative value DISABLES fallback, which means a
-# segment that trips entropy_thold (repetition loop) is never re-decoded, so
-# Whisper emits duplicated text on longer utterances. 0.2 is whisper.cpp's
-# default and lets it retry at higher temperature to break the loop.
+# 0.2 is the whisper.cpp default. A value <= 0 disables temperature fallback,
+# which is whisper's ONLY built-in escape from greedy-decoding repetition loops
+# (the "same phrase pasted 15-50x" bug). The entropy/logprob thresholds below
+# only DETECT a degenerate decode; fallback to a higher temperature is what
+# actually breaks the loop. Keep this strictly positive.
 TEMPERATURE_INC     = 0.2
 MAX_TOKENS          = 256
 _cpu_count = os.cpu_count() or 1
@@ -105,6 +69,61 @@ MIN_SEGMENT_PROB    = 0.35
 # spoken just before the pause are never dropped.
 PROMOTE_MIN_COVERAGE = 0.90
 PROMOTE_MAX_TAIL_S   = 0.6
+# Output guard against runaway repetition loops that slip past whisper's own
+# fallback. A phrase repeated more than this many times in a row is trimmed
+# back to this many copies. Raise if it ever clips legitimate speech.
+MAX_PHRASE_REPEAT   = 2
+
+
+def _collapse_repetitions(text, keep=MAX_PHRASE_REPEAT, max_ngram=10):
+    """Trim runaway Whisper repetition loops.
+
+    A phrase of up to ``max_ngram`` words that repeats more than ``keep`` times
+    in a row is reduced to ``keep`` copies. Words are compared
+    case-insensitively and ignoring surrounding punctuation, but the original
+    tokens are preserved in the output. Ordinary short repeats survive.
+    """
+    words = text.split()
+    n_words = len(words)
+    if n_words <= keep:
+        return text
+
+    def _norm(w):
+        return w.strip(".,!?;:…—-").lower()
+
+    keys = [_norm(w) for w in words]
+    out = []
+    i = 0
+    collapsed_any = False
+    while i < n_words:
+        matched = False
+        # Try the shortest phrase first: a single-word run ("hi hi hi ...")
+        # collapses to one word, while a phrase-level loop ("the cat sat
+        # the cat sat ...") falls through to the n that actually repeats.
+        upper = min(max_ngram, (n_words - i) // 2)
+        for n in range(1, upper + 1):
+            gram = keys[i:i + n]
+            reps = 1
+            j = i + n
+            while j + n <= n_words and keys[j:j + n] == gram:
+                reps += 1
+                j += n
+            if reps > keep:
+                out.extend(words[i:i + n * keep])
+                i = j
+                matched = True
+                collapsed_any = True
+                break
+        if not matched:
+            out.append(words[i])
+            i += 1
+
+    if collapsed_any:
+        LOG_MSG.warning("Collapsed repetition loop: %d words -> %d words",
+                        n_words, len(out))
+        return ' '.join(out)
+    return text
+
 
 class STTGstWhisper(STTGstBase):
     __gtype_name__ = 'STTGstWhisper'
@@ -202,6 +221,10 @@ class STTGstWhisper(STTGstBase):
         self._last_partial_text = None
         self._last_partial_text_samples = 0
         self._partial_lock = threading.Lock()
+        # Whether to actually transcribe. The pipeline keeps capturing (so the
+        # mic meter stays live) whenever the engine is enabled; this flag gates
+        # the VAD/Whisper path so "recognition off" means "monitoring only".
+        self._recognizing = False
 
     def __del__(self):
         LOG_MSG.info("Whisper __del__")
@@ -339,6 +362,10 @@ class STTGstWhisper(STTGstBase):
             rms = float(np.sqrt(np.mean(audio_float ** 2)))
             # Fast attack, slow release so the meter is readable at ~1 Hz.
             self._audio_level = rms if rms > self._audio_level else self._audio_level * 0.8
+
+        # Capture always runs (for the meter); only transcribe when recognising.
+        if not self._recognizing:
+            return Gst.FlowReturn.OK
 
         if self._vad is not None:
             was_in_speech = self._vad._in_speech
@@ -520,6 +547,7 @@ class STTGstWhisper(STTGstBase):
                                       segment_text, prob)
 
                 text = ' '.join(text_parts).strip()
+                text = _collapse_repetitions(text)
 
                 if text and text.lower() not in _HALLUCINATIONS:
                     if source == 'partial':
@@ -609,6 +637,28 @@ class STTGstWhisper(STTGstBase):
     def set_alternatives_num(self, num):
         pass
 
+    def is_recognizing(self):
+        """Whether speech is being transcribed (distinct from capturing)."""
+        return self._recognizing
+
+    def set_recognizing(self, active):
+        active = bool(active)
+        if active == self._recognizing:
+            return
+        self._recognizing = active
+        if active:
+            LOG_MSG.info("recognition on")
+        else:
+            # Turning off: flush any in-progress speech to a final result, then
+            # reset transcription state so nothing leaks while monitoring only.
+            LOG_MSG.info("recognition off")
+            self._stop_partial_timer()
+            self.get_final_results()
+            if self._vad is not None:
+                self._vad._in_speech = False
+            self._chunk_buffer.clear()
+            self._chunk_samples = 0
+
     # --- Status surfaced to the IBus widget --------------------------------
 
     def get_audio_level(self):
@@ -621,7 +671,7 @@ class STTGstWhisper(STTGstBase):
         """(backend_name, in_speech). backend_name is '' if VAD is unavailable."""
         if self._vad is None:
             return ("", False)
-        return (self._vad.backend_name, bool(self._vad._in_speech))
+        return (self._vad.backend_name, bool(self._recognizing and self._vad._in_speech))
 
     def get_model_name(self):
         """Friendly name of the loaded model, or its file basename, or None."""

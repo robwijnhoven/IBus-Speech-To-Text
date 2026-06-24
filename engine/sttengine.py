@@ -70,6 +70,34 @@ def _escape_dead_keys(text):
             out.append(' ')
     return ''.join(out)
 
+
+def _detect_display_server():
+    """Return 'wayland' or 'x11' for the current session.
+
+    The text-injection backend depends on this: Wayland needs ydotool (uinput),
+    while X11 uses xdotool/XTEST. We never hardcode a backend -- one repo is
+    shared between a Wayland desktop and an X11 laptop. An explicit
+    STT_INJECT_BACKEND env var ('ydotool' | 'xdotool' | 'wayland' | 'x11')
+    overrides detection for odd setups (e.g. XWayland-only tooling).
+
+    Detection order: XDG_SESSION_TYPE, then the presence of WAYLAND_DISPLAY vs
+    DISPLAY. Defaults to x11 if nothing is conclusive (the safest legacy path).
+    """
+    override = os.environ.get("STT_INJECT_BACKEND", "").strip().lower()
+    if override in ("wayland", "ydotool"):
+        return "wayland"
+    if override in ("x11", "xdotool"):
+        return "x11"
+
+    session = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
+    if session == "wayland":
+        return "wayland"
+    if session == "x11":
+        return "x11"
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    return "x11"
+
 class STTEngine(IBus.Engine):
     __gtype_name__ = 'STTEngine'
 
@@ -267,8 +295,24 @@ class STTEngine(IBus.Engine):
     def _on_format_preedit_changed(self, settings, key):
         self._format_preedit=self._settings.get_boolean("format-preedit")
 
+    def _is_recognizing(self):
+        # The mic keeps capturing (for the live meter) whenever the engine is
+        # enabled; "recognising" is the separate transcription state shown on
+        # the toggle. Fall back to is_running() for backends without the split.
+        if hasattr(self._engine, "is_recognizing"):
+            return self._engine.is_recognizing()
+        return self._engine.is_running()
+
+    def _set_recognizing(self, active):
+        if hasattr(self._engine, "set_recognizing"):
+            self._engine.set_recognizing(active)
+        elif active:
+            self._engine.run()
+        else:
+            self._engine.stop()
+
     def _update_state(self):
-        if self._engine.is_running() == True:
+        if self._is_recognizing() == True:
             button_state=IBus.PropState.CHECKED
             button_label=IBus.Text(_("Recognition on"))
         else:
@@ -421,9 +465,10 @@ class STTEngine(IBus.Engine):
 
     def _update_status_labels(self):
         running = self._engine.is_running()
-        run_led = _LED_GREEN if running else _LED_RED
 
-        # Microphone signal + energy-history LED.
+        # Microphone LED is the only live-activity indicator: red when not
+        # recording or no signal seen yet, green while audio is flowing,
+        # orange once it has gone quiet for a while.
         level = self._engine.get_audio_level() if hasattr(self._engine, "get_audio_level") else 0.0
         if running:
             if level > _ENERGY_THRESHOLD:
@@ -441,22 +486,32 @@ class STTEngine(IBus.Engine):
         self._set_label("signal-status",
                         "%s  %s" % (mic_led, self._format_signal(level, running)))
 
-        # VAD status.
+        # VAD LED reflects backend availability, not whether we are recording:
+        # green = backend loaded and ready, red = unavailable. The text still
+        # shows the live speaking/idle state.
         if hasattr(self._engine, "get_vad_status"):
             backend, in_speech = self._engine.get_vad_status()
         else:
             backend, in_speech = ("", False)
         if backend:
+            vad_led = _LED_GREEN
             state = _("speaking") if (running and in_speech) else _("idle")
             vad_text = "%s · %-8s" % (backend, state)
         else:
+            vad_led = _LED_RED
             vad_text = _("VAD: unavailable")
-        self._set_label("vad-status", "%s  %s" % (run_led, vad_text))
+        self._set_label("vad-status", "%s  %s" % (vad_led, vad_text))
 
-        # Active model.
+        # Model LED reflects whether a model is loaded/ready, independent of
+        # recording: green = model up, red = none / failed to load.
         name = self._engine.get_model_name() if hasattr(self._engine, "get_model_name") else None
-        model_text = _("Model: %s") % (name if name else _("none"))
-        self._set_label("model-status", "%s  %s" % (run_led, model_text))
+        if name:
+            model_led = _LED_GREEN
+            model_text = _("Model: %s") % name
+        else:
+            model_led = _LED_RED
+            model_text = _("Model: %s") % _("none")
+        self._set_label("model-status", "%s  %s" % (model_led, model_text))
 
     def _on_status_tick(self):
         if not self._engine.is_running():
@@ -509,9 +564,11 @@ class STTEngine(IBus.Engine):
 
         active_on_start = self._settings.get_boolean("active-on-start")
         LOG_MSG.info("engine enabled %s (active_on_start=%s)", self, active_on_start)
-        if active_on_start == True:
-            self._engine.run()
-            self._update_state()
+        # Start capturing immediately so the mic meter is live; recognition
+        # (transcription) follows the active-on-start preference.
+        self._engine.run()
+        self._set_recognizing(active_on_start == True)
+        self._update_state()
 
     def do_disable(self):
         LOG_MSG.info('disable %s', self)
@@ -561,11 +618,9 @@ class STTEngine(IBus.Engine):
         self._menu_visible = False
 
         if prop_name == 'toggle-recording':
-            # State will be updated by the engine
-            if bool(state) == True:
-                self._engine.run()
-            else:
-                self._engine.stop()
+            # Toggle transcription only; the mic keeps capturing for the meter.
+            self._set_recognizing(bool(state) == True)
+            self._update_state()
         elif prop_name == 'dictation-mode':
             if state == True:
                 self._text_processor.mode = STTParseModes.DICTATION
@@ -636,6 +691,47 @@ class STTEngine(IBus.Engine):
     def _partial_formatted_text(self, text_process, utterance):
         self._add_preedit_text(utterance)
 
+    def _inject_text(self, text):
+        """Send committed text to the focused app via the right backend.
+
+        Wayland (ydotool): inject directly through the kernel uinput layer.
+        Clipboard+Ctrl+V is unusable here -- Ctrl+V is "quoted insert" in
+        terminals, so it silently drops text -- and wtype is out because
+        GNOME/Mutter does not implement the virtual-keyboard Wayland protocol.
+        ydotool types *through* the active layout, so us-intl dead keys
+        (' " ` ~ ^) must be escaped (see _escape_dead_keys). --key-delay 0
+        --key-hold 0 removes ydotool's per-key animation (a long sentence would
+        otherwise take 1-2s to appear); with --file - the 1.x client disables
+        its own escape processing, so _escape_dead_keys stays authoritative.
+        Requires the ydotoold user daemon (scripts/install-ydotoold.sh).
+
+        X11 (xdotool): clipboard paste via xclip + Ctrl+V is reliable and fast
+        through XTEST, and needs no daemon.
+
+        The backend is chosen at runtime from the display server, so the same
+        code runs on the Wayland desktop and the X11 laptop unchanged.
+        """
+        backend = _detect_display_server()
+        try:
+            if backend == "wayland":
+                typed_text = _escape_dead_keys(text)
+                subprocess.run(["ydotool", "type", "--key-delay", "0",
+                                "--key-hold", "0", "--file", "-"],
+                               input=typed_text.encode("utf-8"), timeout=10)
+            else:
+                subprocess.run(["xclip", "-selection", "clipboard"],
+                               input=text.encode("utf-8"), timeout=2)
+                subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                               timeout=2)
+        except FileNotFoundError as e:
+            LOG_MSG.error(
+                "Text-injection tool missing for %s backend (%s). "
+                "On Wayland run scripts/install-ydotoold.sh; on X11 install "
+                "xdotool + xclip. Override with STT_INJECT_BACKEND.",
+                backend, e)
+        except Exception as e:
+            LOG_MSG.error("Text injection failed (%s backend): %s", backend, e)
+
     def _final_formatted_text(self, text_process, utterance):
         if self._preediting == True:
             # Don't call this if there was no preediting before
@@ -651,46 +747,14 @@ class STTEngine(IBus.Engine):
             paste_text = utterance.lstrip(' ')
             if paste_text != utterance:
                 paste_text = paste_text + ' '
-            # Separate sentences: if this segment ends a sentence, append a
-            # space so the next dictated segment doesn't glue onto it.
-            if paste_text and paste_text[-1] in ".?!" :
+            # Keep consecutive sentences from gluing together: a sentence that
+            # ends with terminal punctuation gets a trailing space so the next
+            # utterance is not glued onto it.
+            if paste_text and paste_text[-1] in '.?!':
                 paste_text = paste_text + ' '
-            # Type the text directly instead of clipboard paste. ctrl+v is
-            # paste in GUI apps but "quoted insert" in terminals, so a
-            # clipboard+ctrl+v approach silently fails (and clears preedit) in
-            # the terminal. wtype is not an option here: GNOME's compositor
-            # does not implement the virtual-keyboard Wayland protocol.
-            #
-            # ydotool type works (it injects via the kernel uinput layer), but
-            # it goes *through* the active keyboard layout. On us-intl, the
-            # chars ' " ` ~ ^ are DEAD keys that compose with the next char
-            # (so "I'm" -> "Iḿ"). The us-intl way to get a literal dead-key
-            # char is to follow it with a space, which the compose engine
-            # consumes while emitting just the symbol. So insert that space.
-            typed_text = _escape_dead_keys(paste_text)
-            # ydotool inserts a per-key delay AND holds each key, both 20ms by
-            # default on the daemon-backed 1.x client (12ms on the old 0.1.8
-            # fallback client). For a long sentence that is 1-2s of visible
-            # typing animation the user perceives as the system being "slow" --
-            # it is unrelated to GPU decode (~70-200ms). Zeroing both makes the
-            # whole utterance land as fast as the uinput layer allows.
-            #
-            # Requires the ydotoold user daemon (see scripts/install-ydotoold.sh
-            # + the ydotoold.service user unit); without it ydotool falls back
-            # to a slow per-call path and prints "backend unavailable". On X11
-            # machines xdotool/XTEST is used instead and has neither problem --
-            # that is why an X11 laptop feels instant by comparison.
-            #
-            # NOTE: with --file - (stdin) the 1.x client disables its own escape
-            # processing by default, so _escape_dead_keys() remains the single
-            # source of truth for dead-key handling.
-            subprocess.run(["ydotool", "type", "--key-delay", "0",
-                            "--key-hold", "0", "--file", "-"],
-                           input=typed_text.encode("utf-8"), timeout=10)
-            # Track what we actually typed (paste_text, incl. any trailing
-            # sentence space) so _left_text matches the real surrounding text.
-            # Note: _escape_dead_keys spaces are consumed by the compose engine
-            # and do not appear in the text, so use paste_text, not typed_text.
+            # Inject via the backend appropriate to the running display server
+            # (ydotool on Wayland, xdotool+clipboard on X11). See _inject_text.
+            self._inject_text(paste_text)
             self._left_text+=paste_text
             self._left_text_reset=False
             LOG_MSG.debug("current left text (after commit) (%s)", self._left_text)
@@ -726,7 +790,8 @@ class STTEngine(IBus.Engine):
     def do_process_key_event(self, keyval, keycode, state):
         if (state & IBus.ModifierType.RELEASE_MASK) != 0:
             if self._stop_on_key_pressed == True:
-                self._engine.stop()
+                # Stop transcribing on keypress, but keep capturing (meter live).
+                self._set_recognizing(False)
                 self._update_state()
         else:
             # Any keystroke should stop a potential ongoing processing
