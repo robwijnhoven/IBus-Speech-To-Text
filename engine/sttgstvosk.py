@@ -190,7 +190,7 @@ class STTGstVosk(STTGstBase):
         else:
             LOG_MSG.error("unreadable json answer")
 
-    def get_final_results(self):
+    def get_final_results(self, wait=True):
         # There is no final results when not playing or paused
         self._parse_json(self._vosk.get_property("current-final-results"))
 

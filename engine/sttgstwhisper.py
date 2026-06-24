@@ -617,7 +617,20 @@ class STTGstWhisper(STTGstBase):
         self.emit("text", text)
         return False
 
-    def get_final_results(self):
+    def get_final_results(self, wait=True):
+        """Finalize the current utterance.
+
+        wait=True (default) blocks until the worker has emitted the final text
+        -- used by callers that need the result settled (recognition-off, the
+        shortcut dialog, internal finalize).
+
+        wait=False enqueues the final job and returns IMMEDIATELY. This MUST be
+        used from the IBus main/UI thread (e.g. the key-event handler): the
+        worker is single-threaded, so a blocking _process_queue.join() there
+        holds the main loop until decoding finishes -- which froze the keyboard
+        (no keystrokes delivered) while a partial/final decode was in flight.
+        The result is still emitted asynchronously via GLib.idle_add.
+        """
         if self._vad is not None:
             remaining = self._vad.flush()
             if remaining is not None:
@@ -626,7 +639,8 @@ class STTGstWhisper(STTGstBase):
             self._flush_chunks_to_ring()
             self._dispatch_to_worker()
 
-        self._process_queue.join()
+        if wait:
+            self._process_queue.join()
 
     def get_results(self):
         pass
