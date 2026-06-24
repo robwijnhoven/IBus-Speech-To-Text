@@ -98,6 +98,54 @@ def _detect_display_server():
         return "wayland"
     return "x11"
 
+
+_layout_dead_keys_cache = None
+
+
+def _layout_uses_dead_keys():
+    """True if the active keyboard layout composes dead keys (e.g. us-intl).
+
+    When we type *through* the layout (ydotool, or `xdotool type`), us-intl
+    turns ' " ` ~ ^ into dead keys that compose with the next char ("I'm" ->
+    "Iḿ"); _escape_dead_keys() works around it. On a plain `us` layout that
+    escaping would instead emit a literal space, so it must only run when the
+    layout actually needs it.
+
+    STT_DEAD_KEYS=1/0 forces it. Otherwise we probe setxkbmap then localectl
+    for an 'intl'/'dvorak-intl'/... variant. Defaults to False when nothing is
+    conclusive -- the safe direction for `xdotool type` (text stays verbatim).
+    Cached: the layout does not change within a session in practice.
+    """
+    global _layout_dead_keys_cache
+    if _layout_dead_keys_cache is not None:
+        return _layout_dead_keys_cache
+
+    forced = os.environ.get("STT_DEAD_KEYS", "").strip().lower()
+    if forced in ("1", "true", "yes"):
+        _layout_dead_keys_cache = True
+        return True
+    if forced in ("0", "false", "no"):
+        _layout_dead_keys_cache = False
+        return False
+
+    result = False
+    for cmd in (["setxkbmap", "-query"], ["localectl", "status"]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, timeout=2,
+                                 text=True)
+        except Exception:
+            continue
+        blob = (out.stdout or "") + (out.stderr or "")
+        if "intl" in blob.lower():   # us(intl), us-intl, X11 Variant: intl, ...
+            result = True
+            break
+        if "variant:" in blob.lower() or "X11 Layout" in blob:
+            # We got a definitive answer with no intl variant -> plain layout.
+            break
+    _layout_dead_keys_cache = result
+    LOG_MSG.info("Keyboard layout dead-key escaping: %s", result)
+    return result
+
 class STTEngine(IBus.Engine):
     __gtype_name__ = 'STTEngine'
 
@@ -694,40 +742,41 @@ class STTEngine(IBus.Engine):
     def _inject_text(self, text):
         """Send committed text to the focused app via the right backend.
 
-        Wayland (ydotool): inject directly through the kernel uinput layer.
-        Clipboard+Ctrl+V is unusable here -- Ctrl+V is "quoted insert" in
-        terminals, so it silently drops text -- and wtype is out because
-        GNOME/Mutter does not implement the virtual-keyboard Wayland protocol.
-        ydotool types *through* the active layout, so us-intl dead keys
-        (' " ` ~ ^) must be escaped (see _escape_dead_keys). --key-delay 0
-        --key-hold 0 removes ydotool's per-key animation (a long sentence would
-        otherwise take 1-2s to appear); with --file - the 1.x client disables
-        its own escape processing, so _escape_dead_keys stays authoritative.
-        Requires the ydotoold user daemon (scripts/install-ydotoold.sh).
+        Both backends TYPE the text directly (no clipboard): clipboard paste
+        clobbers the user's clipboard and Ctrl+V is "quoted insert" in
+        terminals (silently drops text). Both type *through* the active layout,
+        so us-intl dead keys (' " ` ~ ^) are escaped via _escape_dead_keys()
+        when _layout_uses_dead_keys() says the layout needs it.
 
-        X11 (xdotool): clipboard paste via xclip + Ctrl+V is reliable and fast
-        through XTEST, and needs no daemon.
+        Wayland (ydotool): injects through the kernel uinput layer.
+        --key-delay 0 --key-hold 0 removes ydotool's per-key animation (a long
+        sentence would otherwise take 1-2s to appear); with --file - the 1.x
+        client disables its own escape processing, so _escape_dead_keys stays
+        authoritative. Requires the ydotoold user daemon
+        (scripts/install-ydotoold.sh). wtype is out: GNOME/Mutter lacks the
+        virtual-keyboard Wayland protocol.
 
-        The backend is chosen at runtime from the display server, so the same
-        code runs on the Wayland desktop and the X11 laptop unchanged.
+        X11 (xdotool type): injects through XTEST -- instant, no daemon, no
+        clipboard. --delay 0 disables xdotool's inter-key delay.
+
+        Backend AND dead-key escaping are decided at runtime, so the same code
+        runs unchanged on the Wayland desktop and the X11 laptop.
         """
         backend = _detect_display_server()
+        out_text = _escape_dead_keys(text) if _layout_uses_dead_keys() else text
         try:
             if backend == "wayland":
-                typed_text = _escape_dead_keys(text)
                 subprocess.run(["ydotool", "type", "--key-delay", "0",
                                 "--key-hold", "0", "--file", "-"],
-                               input=typed_text.encode("utf-8"), timeout=10)
+                               input=out_text.encode("utf-8"), timeout=10)
             else:
-                subprocess.run(["xclip", "-selection", "clipboard"],
-                               input=text.encode("utf-8"), timeout=2)
-                subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"],
-                               timeout=2)
+                subprocess.run(["xdotool", "type", "--clearmodifiers",
+                                "--delay", "0", "--", out_text], timeout=10)
         except FileNotFoundError as e:
             LOG_MSG.error(
                 "Text-injection tool missing for %s backend (%s). "
                 "On Wayland run scripts/install-ydotoold.sh; on X11 install "
-                "xdotool + xclip. Override with STT_INJECT_BACKEND.",
+                "xdotool. Override with STT_INJECT_BACKEND.",
                 backend, e)
         except Exception as e:
             LOG_MSG.error("Text injection failed (%s backend): %s", backend, e)
