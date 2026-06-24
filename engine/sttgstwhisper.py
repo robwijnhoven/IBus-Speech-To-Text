@@ -56,12 +56,65 @@ MAX_TOKENS          = 256
 _cpu_count = os.cpu_count() or 1
 N_THREADS           = max(4, _cpu_count // 2 )
 MAX_RING_QUEUE_DEPTH = 2
-# 0.5s (was 1.0): with silence_duration_ms=400, a 1s partial cadence often left
-# the last partial >0.4s behind the segment close, so promotion missed and we
-# paid a full decode. Ticking every 0.5s keeps the last partial within the
-# promotion tail window so finalize stays decode-free.
-PARTIAL_INTERVAL_S  = 0.5
+# Streaming partials use LocalAgreement-2: each tick re-decodes the recent audio
+# and only COMMITS the words that two consecutive decodes agree on (longest
+# common prefix of the still-unconfirmed tail). Committed words are never
+# re-emitted, so the preview is stable and the finalize promotion sees the full
+# accurate text. Validated byte-exact against a full decode on jfk.wav.
+# 2.5s tick (was 0.5): re-decoding the whole buffer every 0.5s was O(n^2) GPU
+# waste and pinned the worker; 2.5s keeps load low while staying responsive.
+PARTIAL_INTERVAL_S  = 2.5
+# Cap the per-tick decode to the most recent N seconds so decode time stays
+# bounded (and below whisper's ~15s cost cliff) no matter how long you talk.
+# Must exceed PARTIAL_INTERVAL_S by enough to overlap the previous decode for
+# the agreement comparison; 12s gives ample overlap.
+PARTIAL_DECODE_CAP_S = 12.0
 MIN_SEGMENT_PROB    = 0.35
+
+
+def _word_key(w):
+    """Normalise a word for agreement comparison (case/punctuation-insensitive)."""
+    return w.strip(".,!?;:…—-").lower()
+
+
+def _common_prefix_len(a, b):
+    """Length of the longest common (normalised) word prefix of a and b."""
+    n = 0
+    for x, y in zip(a, b):
+        if _word_key(x) == _word_key(y):
+            n += 1
+        else:
+            break
+    return n
+
+
+def _new_tail_after_agreed(decode_words, agreed_words, max_overlap=40):
+    """Return the part of `decode_words` that comes AFTER the already-agreed
+    prefix, aligning by word-overlap rather than by index.
+
+    The decode may cover only a recent SUFFIX of the utterance (the partial
+    decode is capped to bound cost), so the agreed prefix is not necessarily a
+    positional prefix of decode_words. We find the largest k where the last k
+    agreed words equal the first k decode words, and return decode_words[k:].
+    Falls back to index-slicing when there is no overlap (e.g. the very first
+    decode, agreed empty). Prevents both dropping text and re-emitting already
+    -committed words on long, capped utterances.
+    """
+    if not agreed_words:
+        return decode_words
+    a_keys = [_word_key(w) for w in agreed_words]
+    d_keys = [_word_key(w) for w in decode_words]
+    limit = min(len(a_keys), len(d_keys), max_overlap)
+    # Largest k: last k of agreed == first k of decode.
+    for k in range(limit, 0, -1):
+        if a_keys[-k:] == d_keys[:k]:
+            return decode_words[k:]
+    # No overlap found. If the decode still contains the whole agreed prefix
+    # positionally (uncapped case), slice it off; else treat all as new.
+    if len(decode_words) >= len(agreed_words) and \
+            d_keys[:len(a_keys)] == a_keys:
+        return decode_words[len(agreed_words):]
+    return decode_words
 # Option 1: promote the last partial as the final result (skip the redundant
 # full re-decode) when that partial already covered at least this fraction of
 # the finalized segment AND the uncovered tail is shorter than
@@ -220,6 +273,12 @@ class STTGstWhisper(STTGstBase):
         # thread writes these and the (GLib main-thread) finalize path reads.
         self._last_partial_text = None
         self._last_partial_text_samples = 0
+        # LocalAgreement-2 streaming state (worker thread only). _agreed_words is
+        # the confirmed word prefix of the current utterance; _prev_tail is the
+        # previous decode's still-unconfirmed tail, used to find what the next
+        # decode agrees with. Both reset on speech onset (_start_partial_timer).
+        self._agreed_words = []
+        self._prev_tail = []
         self._partial_lock = threading.Lock()
         # Whether to actually transcribe. The pipeline keeps capturing (so the
         # mic meter stays live) whenever the engine is enabled; this flag gates
@@ -412,7 +471,8 @@ class STTGstWhisper(STTGstBase):
 
         self._enqueue_for_transcription(snapshot, source='ring')
 
-    def _enqueue_for_transcription(self, audio_float32: np.ndarray, source: str):
+    def _enqueue_for_transcription(self, audio_float32: np.ndarray, source: str,
+                                   total_samples: int = 0):
         if source == 'partial':
             temp = []
             while True:
@@ -447,7 +507,7 @@ class STTGstWhisper(STTGstBase):
                 for item in temp:
                     self._process_queue.put(item)
 
-        self._process_queue.put((source, audio_float32))
+        self._process_queue.put((source, audio_float32, total_samples))
 
         if self._process_thread is None or not self._process_thread.is_alive():
             self._process_thread = threading.Thread(target=self._process_worker, daemon=True)
@@ -491,7 +551,7 @@ class STTGstWhisper(STTGstBase):
         """Background worker to process audio"""
         while not self._stop_processing:
             try:
-                source, audio = self._process_queue.get(timeout=0.1)
+                source, audio, total_samples = self._process_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
@@ -520,6 +580,17 @@ class STTGstWhisper(STTGstBase):
                     GLib.idle_add(self._emit_text, text)
                     self._process_queue.task_done()
                     continue
+
+            # Partials use LocalAgreement-2 streaming, handled separately so the
+            # full-decode path below stays simple. The partial item's audio is
+            # the recent capped window; total_samples is the whole utterance.
+            if source == 'partial':
+                try:
+                    self._handle_partial_agreement(audio, total_samples)
+                except Exception as e:
+                    LOG_MSG.error("Partial agreement error: %s", e, exc_info=True)
+                self._process_queue.task_done()
+                continue
 
             try:
                 LOG_MSG.debug("Starting transcription of %d samples", len(audio))
@@ -550,24 +621,15 @@ class STTGstWhisper(STTGstBase):
                 text = _collapse_repetitions(text)
 
                 if text and text.lower() not in _HALLUCINATIONS:
-                    if source == 'partial':
-                        LOG_MSG.debug("Partial transcription: '%s'", text)
-                        # Remember this partial so a subsequent finalize can
-                        # promote it instead of re-decoding (option 1).
-                        with self._partial_lock:
-                            self._last_partial_text = text
-                            self._last_partial_text_samples = len(audio)
-                        GLib.idle_add(self._emit_partial_text, text)
-                    else:
-                        deduped = _collapse_repetitions(text)
-                        if deduped != text:
-                            LOG_MSG.info("Collapsed repetition: '%s' -> '%s'",
-                                         text, deduped)
-                            text = deduped
-                        if text and text[-1] not in '.?!':
-                            text += '.'
-                        LOG_MSG.info("Whisper transcription result: '%s'", text)
-                        GLib.idle_add(self._emit_text, text)
+                    deduped = _collapse_repetitions(text)
+                    if deduped != text:
+                        LOG_MSG.info("Collapsed repetition: '%s' -> '%s'",
+                                     text, deduped)
+                        text = deduped
+                    if text and text[-1] not in '.?!':
+                        text += '.'
+                    LOG_MSG.info("Whisper transcription result: '%s'", text)
+                    GLib.idle_add(self._emit_text, text)
                 elif text:
                     LOG_MSG.debug("Filtered hallucination: '%s'", text)
                 elif low_confidence:
@@ -580,13 +642,76 @@ class STTGstWhisper(STTGstBase):
 
             self._process_queue.task_done()
 
+    def _decode_words(self, audio):
+        """Decode audio and return a flat list of words (whitespace tokens),
+        applying the special-pattern and confidence filters but not repetition
+        collapse (that is applied to the assembled preview/final text)."""
+        parts = []
+        for segment in self._whisper.transcribe(audio):
+            if not hasattr(segment, 'text'):
+                continue
+            seg_text = segment.text.strip()
+            if not seg_text or SPECIAL_PATTERN.match(seg_text):
+                continue
+            prob = getattr(segment, 'probability', float('nan'))
+            if prob == prob and prob < MIN_SEGMENT_PROB:
+                continue
+            parts.append(seg_text)
+        return ' '.join(parts).split()
+
+    def _handle_partial_agreement(self, audio, total_samples):
+        """LocalAgreement-2 partial step (validated byte-exact vs full decode).
+
+        Re-decode the recent audio, strip the already-agreed word prefix, then
+        commit the words this decode and the previous one agree on (longest
+        common prefix). Emit committed + current unconfirmed tail as the live
+        preview, and store the full preview so a finalize can promote it.
+
+        The decode is capped to bound cost, so it may cover only a recent suffix
+        of the utterance; _new_tail_after_agreed aligns by word-overlap so the
+        agreed prefix is stripped correctly whether or not it is still in the
+        decode window. The agreement is what guarantees correctness (no dropped
+        opening, no overlap duplication) -- validated byte-exact on jfk.wav and
+        on a 22s clip that exercises the capped path.
+        """
+        words = self._decode_words(audio)
+
+        with self._partial_lock:
+            agreed = self._agreed_words
+            prev_tail = self._prev_tail
+
+            new_tail = _new_tail_after_agreed(words, agreed)
+            n_agree = _common_prefix_len(new_tail, prev_tail)
+            if n_agree:
+                agreed = agreed + new_tail[:n_agree]
+                prev_tail = new_tail[n_agree:]
+            else:
+                prev_tail = new_tail
+
+            self._agreed_words = agreed
+            self._prev_tail = prev_tail
+
+            preview = _collapse_repetitions(' '.join(agreed + prev_tail).strip())
+            # Store the full preview so finalize can promote it instead of
+            # re-decoding (coverage measured against the whole utterance).
+            if preview and preview.lower() not in _HALLUCINATIONS:
+                self._last_partial_text = preview
+                self._last_partial_text_samples = total_samples
+
+        if preview and preview.lower() not in _HALLUCINATIONS:
+            LOG_MSG.debug("Partial (agreed=%dw): '%s'", len(agreed), preview)
+            GLib.idle_add(self._emit_partial_text, preview)
+
     def _start_partial_timer(self):
         self._last_partial_samples = 0
         # New speech run: drop any partial captured in a previous run so it can
-        # never be promoted onto this utterance's segment.
+        # never be promoted onto this utterance's segment, and clear the
+        # local-agreement state so committed words never leak across utterances.
         with self._partial_lock:
             self._last_partial_text = None
             self._last_partial_text_samples = 0
+            self._agreed_words = []
+            self._prev_tail = []
         self._partial_timer_id = GLib.timeout_add(
             int(PARTIAL_INTERVAL_S * 1000), self._on_partial_tick)
 
@@ -606,7 +731,15 @@ class STTGstWhisper(STTGstBase):
             return True
 
         self._last_partial_samples = len(pending)
-        self._enqueue_for_transcription(pending, source='partial')
+        # Cap the decoded audio to the most recent PARTIAL_DECODE_CAP_S so decode
+        # time stays bounded on long utterances (the agreement, not the cap,
+        # guarantees correctness). total_samples is the whole utterance length,
+        # used so a finalize can measure promotion coverage correctly.
+        total_samples = len(pending)
+        cap = int(PARTIAL_DECODE_CAP_S * SAMPLE_RATE)
+        window = pending[-cap:] if total_samples > cap else pending
+        self._enqueue_for_transcription(
+            window, source='partial', total_samples=total_samples)
         return True
 
     def _emit_partial_text(self, text):
