@@ -843,9 +843,15 @@ class STTEngine(IBus.Engine):
                 self._set_recognizing(False)
                 self._update_state()
         else:
-            # Any keystroke should stop a potential ongoing processing
+            # Any keystroke should stop a potential ongoing processing.
+            # wait=False is REQUIRED here: this runs on the IBus main/UI thread,
+            # and a blocking finalize (_process_queue.join) held the main loop
+            # until decoding finished, which froze the keyboard -- keystrokes
+            # were not delivered while a decode was in flight, "fixed" only once
+            # speaking drained the queue. The final text is still emitted
+            # asynchronously by the worker.
             if self._text_processor.is_processing() == True:
-                self._engine.get_final_results()
+                self._engine.get_final_results(wait=False)
 
             # Usually there is a "set-surrounding-text" event after a key press.
             # So get ready for the update (though we keep our current one if
