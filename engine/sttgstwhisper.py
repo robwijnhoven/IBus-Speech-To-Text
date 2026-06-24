@@ -581,6 +581,37 @@ class STTGstWhisper(STTGstBase):
                     self._process_queue.task_done()
                     continue
 
+                # Promotion failed (the last partial lagged the segment close by
+                # more than PROMOTE_MAX_TAIL_S). Rather than re-decode the WHOLE
+                # segment -- which on a long (>~15s) utterance makes whisper
+                # duplicate phrases and drop the tail (observed: a 26s blob came
+                # back worse than the streamed partials) -- keep the correct
+                # streamed text and decode ONLY the uncovered tail, then append.
+                # The streamed partial is already-agreed text; whisper only ever
+                # sees the short tail, so its long-audio failure mode is avoided.
+                if (partial_text and partial_samples > 0
+                        and 0 < partial_samples < len(audio)):
+                    tail_audio = audio[partial_samples:]
+                    tail_s = len(tail_audio) / SAMPLE_RATE
+                    LOG_MSG.info("Promotion failed; keeping streamed text + "
+                                 "decoding %.1fs tail (avoids long re-decode)",
+                                 tail_s)
+                    try:
+                        tail_words = self._decode_words(tail_audio)
+                    except Exception as e:
+                        LOG_MSG.error("Tail decode failed: %s", e)
+                        tail_words = []
+                    text = (partial_text.strip() + " "
+                            + ' '.join(tail_words)).strip()
+                    text = _collapse_repetitions(text)
+                    if text and text.lower() not in _HALLUCINATIONS:
+                        if text[-1] not in '.?!':
+                            text += '.'
+                        LOG_MSG.info("Final (streamed + tail): '%s'", text)
+                        GLib.idle_add(self._emit_text, text)
+                    self._process_queue.task_done()
+                    continue
+
             # Partials use LocalAgreement-2 streaming, handled separately so the
             # full-decode path below stays simple. The partial item's audio is
             # the recent capped window; total_samples is the whole utterance.

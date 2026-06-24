@@ -17,6 +17,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
+import time
 import subprocess
 import logging
 
@@ -173,6 +174,8 @@ class STTEngine(IBus.Engine):
 
         self._left_text=""
         self._left_text_reset=True
+        # Last focused IBus client name, for injection diagnostics.
+        self._focus_client="?"
 
         self._preediting=False
 
@@ -629,6 +632,9 @@ class STTEngine(IBus.Engine):
 
     def do_focus_in_id(self, object_path, client):
         LOG_MSG.debug("focus in id %s %s", object_path, client)
+        # Remember the focused client so injection logging can show where text
+        # was typed (helps diagnose dropped/misrouted keystrokes).
+        self._focus_client = client or object_path or "?"
         # Safety: never stay frozen if a property-hide was missed.
         self._menu_visible = False
         # FIXME: hopefully ibus 1.5.28 will have property needs_surrounding_text
@@ -764,14 +770,39 @@ class STTEngine(IBus.Engine):
         """
         backend = _detect_display_server()
         out_text = _escape_dead_keys(text) if _layout_uses_dead_keys() else text
+        # Diagnostics: dropped/misrouted keystrokes (a whole segment silently not
+        # landing) leave NO error -- the subprocess returns 0 but the compositor
+        # dropped the keys. Log enough to correlate a future drop: char/byte
+        # count, elapsed time, return code, stderr, and the focused client.
+        n_chars = len(out_text)
+        n_bytes = len(out_text.encode("utf-8"))
+        client = getattr(self, "_focus_client", "?")
+        LOG_MSG.info("Inject START backend=%s chars=%d bytes=%d client=%s text=%r",
+                     backend, n_chars, n_bytes, client,
+                     out_text[:80] + ("…" if n_chars > 80 else ""))
+        t0 = time.monotonic()
         try:
             if backend == "wayland":
-                subprocess.run(["ydotool", "type", "--key-delay", "0",
-                                "--key-hold", "0", "--file", "-"],
-                               input=out_text.encode("utf-8"), timeout=10)
+                proc = subprocess.run(
+                    ["ydotool", "type", "--key-delay", "0",
+                     "--key-hold", "0", "--file", "-"],
+                    input=out_text.encode("utf-8"), timeout=10,
+                    capture_output=True)
             else:
-                subprocess.run(["xdotool", "type", "--clearmodifiers",
-                                "--delay", "0", "--", out_text], timeout=10)
+                proc = subprocess.run(
+                    ["xdotool", "type", "--clearmodifiers", "--delay", "0",
+                     "--", out_text], timeout=10, capture_output=True)
+            elapsed = time.monotonic() - t0
+            stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()
+            rate = (n_chars / elapsed) if elapsed > 0 else 0.0
+            level = LOG_MSG.warning if (proc.returncode != 0 or stderr) else LOG_MSG.info
+            level("Inject DONE backend=%s rc=%d chars=%d in %.3fs (%.0f ch/s)%s",
+                  backend, proc.returncode, n_chars, elapsed, rate,
+                  (" stderr=%r" % stderr) if stderr else "")
+        except subprocess.TimeoutExpired:
+            LOG_MSG.error("Inject TIMEOUT backend=%s after %.1fs chars=%d -- "
+                          "keystrokes likely partially dropped", backend,
+                          time.monotonic() - t0, n_chars)
         except FileNotFoundError as e:
             LOG_MSG.error(
                 "Text-injection tool missing for %s backend (%s). "
