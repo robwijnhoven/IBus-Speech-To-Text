@@ -240,12 +240,12 @@ class STTGstWhisper(STTGstBase):
         if VAD_MODULE_OK:
             self._vad = STTVad(
                 speech_threshold=0.5,
-                # 800ms: the user's chosen optimum between snappy finalize and
+                # 1000ms: the user's chosen optimum between snappy finalize and
                 # stitching short mid-thought pauses. This silence window is the
                 # only felt delay now that injection is instant (ydotoold +
                 # zeroed ydotool key-delay/key-hold). Was 300 -> 1200 -> 1000 ->
-                # 800.
-                silence_duration_ms=800,
+                # 800 -> 1000.
+                silence_duration_ms=1000,
                 speech_pad_ms=200,
                 min_speech_duration_ms=300,
                 # Raised 15 -> 30: a long uninterrupted sentence used to be
