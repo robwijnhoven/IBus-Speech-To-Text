@@ -122,6 +122,16 @@ def _new_tail_after_agreed(decode_words, agreed_words, max_overlap=40):
 # spoken just before the pause are never dropped.
 PROMOTE_MIN_COVERAGE = 0.90
 PROMOTE_MAX_TAIL_S   = 0.6
+# When the tail-decode path fires, feed whisper this many trailing words of the
+# already-streamed text as initial_prompt so the short tail slice is decoded as
+# a mid-sentence continuation, not a freshly-capitalised standalone sentence
+# (else a trailing word like "better" comes back as "Better."). ~20 words ≈ one
+# clause of context -- enough to disambiguate continue-vs-new-sentence without
+# risking whisper echoing a long prompt back into the output. Fed across any
+# sentence boundary on purpose: 56% of partials already end in '.', and cutting
+# at the boundary would starve exactly the case this fixes ("...stands out." +
+# "better" must still continue, not capitalise).
+TAIL_PROMPT_WORDS   = 20
 # Output guard against runaway repetition loops that slip past whisper's own
 # fallback. A phrase repeated more than this many times in a row is trimmed
 # back to this many copies. Raise if it ever clips legitimate speech.
@@ -240,12 +250,12 @@ class STTGstWhisper(STTGstBase):
         if VAD_MODULE_OK:
             self._vad = STTVad(
                 speech_threshold=0.5,
-                # 1000ms: the user's chosen optimum between snappy finalize and
+                # 800ms: the user's chosen optimum between snappy finalize and
                 # stitching short mid-thought pauses. This silence window is the
                 # only felt delay now that injection is instant (ydotoold +
                 # zeroed ydotool key-delay/key-hold). Was 300 -> 1200 -> 1000 ->
-                # 800 -> 1000.
-                silence_duration_ms=1000,
+                # 800.
+                silence_duration_ms=800,
                 speech_pad_ms=200,
                 min_speech_duration_ms=300,
                 # Raised 15 -> 30: a long uninterrupted sentence used to be
@@ -596,10 +606,24 @@ class STTGstWhisper(STTGstBase):
                     LOG_MSG.info("Promotion failed; keeping streamed text + "
                                  "decoding %.1fs tail (avoids long re-decode)",
                                  tail_s)
+                    # Give the tail decode the last few streamed words as
+                    # context so it continues the sentence instead of starting
+                    # a new (capitalised) one.
+                    prompt = ' '.join(
+                        partial_text.strip().split()[-TAIL_PROMPT_WORDS:])
                     try:
-                        tail_words = self._decode_words(tail_audio)
+                        tail_words = self._decode_words(
+                            tail_audio, initial_prompt=prompt)
                     except Exception as e:
                         LOG_MSG.error("Tail decode failed: %s", e)
+                        tail_words = []
+                    # The tail is short, low-context audio -- whisper's prime
+                    # hallucination case ("Thank you.", "you.", "um."). The
+                    # streamed text already holds the real words, so drop a tail
+                    # that, on its own, is nothing but a known filler phrase.
+                    tail_text = ' '.join(tail_words).strip()
+                    if tail_text and tail_text.lower() in _HALLUCINATIONS:
+                        LOG_MSG.info("Dropped hallucinated tail: '%s'", tail_text)
                         tail_words = []
                     text = (partial_text.strip() + " "
                             + ' '.join(tail_words)).strip()
@@ -673,12 +697,21 @@ class STTGstWhisper(STTGstBase):
 
             self._process_queue.task_done()
 
-    def _decode_words(self, audio):
+    def _decode_words(self, audio, initial_prompt=None):
         """Decode audio and return a flat list of words (whitespace tokens),
         applying the special-pattern and confidence filters but not repetition
-        collapse (that is applied to the assembled preview/final text)."""
+        collapse (that is applied to the assembled preview/final text).
+
+        ``initial_prompt`` gives whisper the words spoken just before this audio
+        so an isolated tail slice is decoded as a mid-sentence continuation
+        (lowercased, not re-capitalised) instead of a standalone sentence. The
+        model is loaded with no_context=True, but initial_prompt is an explicit
+        user prompt and is honoured independently of that flag."""
+        kwargs = {}
+        if initial_prompt:
+            kwargs["initial_prompt"] = initial_prompt
         parts = []
-        for segment in self._whisper.transcribe(audio):
+        for segment in self._whisper.transcribe(audio, **kwargs):
             if not hasattr(segment, 'text'):
                 continue
             seg_text = segment.text.strip()
