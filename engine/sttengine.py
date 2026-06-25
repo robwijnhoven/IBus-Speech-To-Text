@@ -72,6 +72,18 @@ def _escape_dead_keys(text):
     return ''.join(out)
 
 
+def _blob_indicates_dead_keys(blob):
+    """True if an xkb-query blob names a dead-key (international) layout.
+
+    Matches the 'intl' variant (us(intl), us-intl, X11 Variant: intl) but
+    EXCLUDES 'alt-intl': the alternative-international layout keeps ' and " as
+    normal keys and reaches accents via AltGr, so it is NOT dead-key. Without
+    the exclusion the substring 'intl' matches 'alt-intl' too, escaping fires
+    wrongly and types  that's -> that' s  and  "thank -> " thank .
+    """
+    return "intl" in blob.lower().replace("alt-intl", "")
+
+
 def _detect_display_server():
     """Return 'wayland' or 'x11' for the current session.
 
@@ -137,7 +149,7 @@ def _layout_uses_dead_keys():
         except Exception:
             continue
         blob = (out.stdout or "") + (out.stderr or "")
-        if "intl" in blob.lower():   # us(intl), us-intl, X11 Variant: intl, ...
+        if _blob_indicates_dead_keys(blob):   # us(intl), us-intl -- NOT alt-intl
             result = True
             break
         if "variant:" in blob.lower() or "X11 Layout" in blob:
@@ -914,3 +926,16 @@ class STTEngine(IBus.Engine):
 
         # We need to chain this function if we want get_surrounding_text to work
         IBus.Engine.do_set_surrounding_text(self, ibus_text, cursor_pos, anchor_pos)
+
+
+if __name__ == "__main__":
+    # Self-check: dead-key escaping must fire for real intl layouts but NOT for
+    # alt-intl (where ' and " are normal keys), which was typing  that's  as
+    # that' s . Regression guard for _blob_indicates_dead_keys.
+    assert _blob_indicates_dead_keys("layout: us\nvariant: intl,")        # us-intl
+    assert _blob_indicates_dead_keys("X11 Variant: intl")
+    assert not _blob_indicates_dead_keys("layout: us,us\nvariant: alt-intl,")  # the bug
+    assert not _blob_indicates_dead_keys("layout: us\nvariant: ,")        # plain us
+    assert _escape_dead_keys("that's") == "that' s"   # escaping itself unchanged
+    assert _escape_dead_keys("plain") == "plain"
+    print("sttengine dead-key self-check OK")
