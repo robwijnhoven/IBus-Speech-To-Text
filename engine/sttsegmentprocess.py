@@ -35,6 +35,7 @@ class STTSegment():
             self._last_word=""
             self._utterance=""
             self._shortcuts=[]
+            self._quote_open=False
         else:
             self._reset()
 
@@ -45,6 +46,7 @@ class STTSegment():
         self._last_word=""
         self._utterance=""
         self._shortcuts=[]
+        self._quote_open=False
 
     def is_empty(self):
         if self._diacritic == None and \
@@ -267,8 +269,25 @@ class STTSegmentProcess(GObject.GObject, STTParserInterface):
         else :
             last_char=self._text_left[-1] if self._text_left != "" else ""
 
-            if word not in self._parser.no_space_before and \
-               last_char not in self._parser.no_space_after and \
+            # A standalone straight double-quote is ambiguous: an opening quote
+            # wants no space *after* it, a closing quote no space *before* it.
+            # whisper.cpp emits quotes space-separated, so split() yields bare
+            # '"' tokens that would otherwise paste as ' " thank you " '. Track
+            # open/close parity within the segment so the quote hugs the right
+            # side. ponytail: per-segment parity; a quote spanning two finalized
+            # segments (rare with whisper's chunking) restarts as "opening".
+            no_space_before=self._parser.no_space_before
+            no_space_after=self._parser.no_space_after
+            quoting=self._segment._quote_open
+            if word == '"':
+                if quoting:                          # closes a quote
+                    no_space_before=no_space_before+'"'   # hug previous word
+                self._segment._quote_open=not quoting
+            elif last_char == '"' and quoting:       # word right after opening "
+                no_space_after=no_space_after+'"'         # hug the quote
+
+            if word not in no_space_before and \
+               last_char not in no_space_after and \
                last_char != "":
                 self._segment._utterance += " "
 
@@ -407,3 +426,30 @@ class STTSegmentProcess(GObject.GObject, STTParserInterface):
 
         self._context._first = None
         self._context._last = None
+
+
+if __name__ == "__main__":
+    # Self-check: whisper emits quotes space-separated, so split() yields bare
+    # '"' tokens. Parity-based spacing must hug the right side instead of
+    # pasting ' " thank you " '. Attached quotes must keep working.
+    import logging
+    logging.getLogger().setLevel(logging.CRITICAL)
+
+    def _format(text):
+        p = STTSegmentProcess()
+        out = {}
+        p.connect("final-text", lambda obj, t: out.setdefault("t", t))
+        p.utterance_process_end(text, "")
+        return out.get("t")
+
+    cases = {
+        'I keep saying " thank you "': 'I keep saying "thank you"',  # the bug
+        'say " thank you " now':       'Say "thank you" now',
+        'I keep saying "thank you"':   'I keep saying "thank you"',  # attached, unchanged
+        'He said "hi" to me.':         'He said "hi" to me.',
+    }
+    for src, want in cases.items():
+        got = _format(src)
+        assert got == want, f"{src!r} -> {got!r}, expected {want!r}"
+
+    print("sttsegmentprocess self-check OK")
