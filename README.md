@@ -1,5 +1,15 @@
 # IBus Speech To Text Input Method
-A speech to text IBus Input Method using VOSK, written in Python. When enabled, you can dictate text to any application supporting IBus (most if not all applications do).
+
+> **Fork note (`sst-local` branch).** This fork replaces VOSK with **whisper.cpp**
+> (`large-v3-turbo`, GPU-accelerated via ROCm) and adds live streaming partials,
+> a context-fed tail decode, and runtime display-server detection for text
+> injection. The "Description" / "Dependencies" sections below are inherited from
+> upstream and describe the original VOSK design; see **Fork notes** at the bottom
+> for what actually differs here. Operational/engineering detail (tuning knobs,
+> latency architecture, runtime layout) lives in the project-root `CLAUDE.md`,
+> which is intentionally *not* tracked in this repo.
+
+A speech to text IBus Input Method, written in Python. When enabled, you can dictate text to any application supporting IBus (most if not all applications do).
 
 Description
 ============
@@ -67,12 +77,51 @@ It might seem obvious but the quality of the microphone used largely influences 
 
 This Input Method can also be enabled and disabled with the default shorcut ("Win + Space") used to switch between IBus Input Methods. By default, when IBus STT is enabled, voice recognition is not started immediately but there is a setting to change this behaviour. If enabled, you can start and stop voice recognition with the above shortcut.
 
-TODO / Notes
-============
+Fork notes (`sst-local`)
+========================
 
-- The clipboard + paste backend is currently hardcoded (this branch uses
-  `xclip` + `xdotool`; upstream uses `wl-copy` + `ydotool`). It should instead
-  auto-detect the session type at runtime and pick the right tools — `wl-copy` +
-  `ydotool` on Wayland, `xclip` + `xdotool` on X11 — e.g. by checking
-  `XDG_SESSION_TYPE` / `WAYLAND_DISPLAY`. See the paste logic in
-  `engine/sttengine.py` (`_commit_text` / utterance commit). Fix next time.
+What differs from upstream on this branch:
+
+- **Engine is whisper.cpp**, not VOSK — `large-v3-turbo`, run on the GPU via
+  ROCm. Audio path: PipeWire → GStreamer → Silero VAD → whisper.cpp → keystroke
+  injection.
+- **Text injection auto-detects the display server at runtime** (this replaces
+  the old hardcoded-backend TODO, which is now done). `_detect_display_server()`
+  reads `XDG_SESSION_TYPE` (falls back to `WAYLAND_DISPLAY`/`DISPLAY`), and
+  `STT_INJECT_BACKEND` force-overrides it. Wayland types directly via `ydotool`
+  (needs the `ydotoold` daemon); X11 pastes via `xclip` + `xdotool key ctrl+v`.
+  The same code runs unchanged on both the Wayland PC and the X11 laptop, which
+  is why this is one shared branch.
+- **Streaming partials + context-fed tail decode.** A live preedit is shown by
+  re-decoding the speech-so-far every `PARTIAL_INTERVAL_S`. On finalize, if the
+  last partial nearly covered the segment it is promoted as the final result;
+  otherwise only the uncovered tail is decoded — and that tail decode is fed the
+  last `TAIL_PROMPT_WORDS` of streamed text as `initial_prompt` so a trailing
+  word continues the sentence (no spurious `"Better."` capitalisation) and a
+  filler-only tail (`"Thank you."`, `"um."`) is dropped. See `CLAUDE.md`
+  "Latency architecture" for the full rationale.
+
+Contributing to the fork
+=========================
+
+The git repo is this `IBus-Speech-To-Text/` directory; the project root above it
+is not versioned. Push to the **`fork`** remote (`robwijnhoven`), never `origin`
+(upstream). Working branch is **`sst-local`**, shared by both dev machines:
+
+```
+cd IBus-Speech-To-Text
+git add engine/<file>.py
+git commit -m "..."
+git push fork sst-local
+```
+
+Because both machines share `sst-local`, a push is often rejected with
+`! [rejected] (fetch first)`. **Do not force-push** — rebase onto the remote and
+re-push (the two machines touch different code, so this is normally
+conflict-free):
+
+```
+git fetch fork
+git rebase fork/sst-local
+git push fork sst-local
+```
