@@ -104,6 +104,10 @@ What differs from upstream on this branch:
   kills the seam duplication (`...the script. The script.`) that
   `_collapse_repetitions` can't touch without also eating real doubles like
   `"no no"`. See `CLAUDE.md` "Latency architecture" for the full rationale.
+  Partials are streamed **only to clients that advertise `PREEDIT_TEXT`**: an app
+  without it (snap/Electron apps such as Slack) makes IBus *commit* each preedit
+  update as permanent text, so every partial was pasted in full (spoke once,
+  printed 2-3×). Such clients now get only the final commit (`_update_partial_usage`).
 
 Contributing to the fork
 =========================
