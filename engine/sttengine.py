@@ -17,7 +17,6 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
-import time
 import subprocess
 import logging
 
@@ -55,109 +54,6 @@ _ENERGY_THRESHOLD   = 0.01
 # then turns orange. 10 ticks ~= 10 seconds.
 _ENERGY_GREEN_TICKS = 10
 
-# On the US-International (us+intl) keyboard layout these chars are dead keys:
-# typed alone they wait to compose with the next character (' + m -> ḿ). Since
-# we inject text with `ydotool type`, which goes through the active layout, we
-# follow each dead-key char with a space. The us-intl compose engine consumes
-# that space and emits the literal symbol, so "I'm" types as "I'm" not "Iḿ".
-# (Verified: typing "A' B" yields "A'B".)
-_US_INTL_DEAD_KEYS = "'\"`~^"
-
-def _escape_dead_keys(text):
-    out = []
-    for ch in text:
-        out.append(ch)
-        if ch in _US_INTL_DEAD_KEYS:
-            out.append(' ')
-    return ''.join(out)
-
-
-def _blob_indicates_dead_keys(blob):
-    """True if an xkb-query blob names a dead-key (international) layout.
-
-    Matches the 'intl' variant (us(intl), us-intl, X11 Variant: intl) but
-    EXCLUDES 'alt-intl': the alternative-international layout keeps ' and " as
-    normal keys and reaches accents via AltGr, so it is NOT dead-key. Without
-    the exclusion the substring 'intl' matches 'alt-intl' too, escaping fires
-    wrongly and types  that's -> that' s  and  "thank -> " thank .
-    """
-    return "intl" in blob.lower().replace("alt-intl", "")
-
-
-def _detect_display_server():
-    """Return 'wayland' or 'x11' for the current session.
-
-    The text-injection backend depends on this: Wayland needs ydotool (uinput),
-    while X11 uses xdotool/XTEST. We never hardcode a backend -- one repo is
-    shared between a Wayland desktop and an X11 laptop. An explicit
-    STT_INJECT_BACKEND env var ('ydotool' | 'xdotool' | 'wayland' | 'x11')
-    overrides detection for odd setups (e.g. XWayland-only tooling).
-
-    Detection order: XDG_SESSION_TYPE, then the presence of WAYLAND_DISPLAY vs
-    DISPLAY. Defaults to x11 if nothing is conclusive (the safest legacy path).
-    """
-    override = os.environ.get("STT_INJECT_BACKEND", "").strip().lower()
-    if override in ("wayland", "ydotool"):
-        return "wayland"
-    if override in ("x11", "xdotool"):
-        return "x11"
-
-    session = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
-    if session == "wayland":
-        return "wayland"
-    if session == "x11":
-        return "x11"
-    if os.environ.get("WAYLAND_DISPLAY"):
-        return "wayland"
-    return "x11"
-
-
-_layout_dead_keys_cache = None
-
-
-def _layout_uses_dead_keys():
-    """True if the active keyboard layout composes dead keys (e.g. us-intl).
-
-    When we type *through* the layout (ydotool, or `xdotool type`), us-intl
-    turns ' " ` ~ ^ into dead keys that compose with the next char ("I'm" ->
-    "Iḿ"); _escape_dead_keys() works around it. On a plain `us` layout that
-    escaping would instead emit a literal space, so it must only run when the
-    layout actually needs it.
-
-    STT_DEAD_KEYS=1/0 forces it. Otherwise we probe setxkbmap then localectl
-    for an 'intl'/'dvorak-intl'/... variant. Defaults to False when nothing is
-    conclusive -- the safe direction for `xdotool type` (text stays verbatim).
-    Cached: the layout does not change within a session in practice.
-    """
-    global _layout_dead_keys_cache
-    if _layout_dead_keys_cache is not None:
-        return _layout_dead_keys_cache
-
-    forced = os.environ.get("STT_DEAD_KEYS", "").strip().lower()
-    if forced in ("1", "true", "yes"):
-        _layout_dead_keys_cache = True
-        return True
-    if forced in ("0", "false", "no"):
-        _layout_dead_keys_cache = False
-        return False
-
-    result = False
-    for cmd in (["setxkbmap", "-query"], ["localectl", "status"]):
-        try:
-            out = subprocess.run(cmd, capture_output=True, timeout=2,
-                                 text=True)
-        except Exception:
-            continue
-        blob = (out.stdout or "") + (out.stderr or "")
-        if _blob_indicates_dead_keys(blob):   # us(intl), us-intl -- NOT alt-intl
-            result = True
-            break
-        if "variant:" in blob.lower() or "X11 Layout" in blob:
-            # We got a definitive answer with no intl variant -> plain layout.
-            break
-    _layout_dead_keys_cache = result
-    LOG_MSG.info("Keyboard layout dead-key escaping: %s", result)
-    return result
 
 class STTEngine(IBus.Engine):
     __gtype_name__ = 'STTEngine'
@@ -757,73 +653,6 @@ class STTEngine(IBus.Engine):
     def _partial_formatted_text(self, text_process, utterance):
         self._add_preedit_text(utterance)
 
-    def _inject_text(self, text):
-        """Send committed text to the focused app via the right backend.
-
-        Both backends TYPE the text directly (no clipboard): clipboard paste
-        clobbers the user's clipboard and Ctrl+V is "quoted insert" in
-        terminals (silently drops text). Both type *through* the active layout,
-        so us-intl dead keys (' " ` ~ ^) are escaped via _escape_dead_keys()
-        when _layout_uses_dead_keys() says the layout needs it.
-
-        Wayland (ydotool): injects through the kernel uinput layer.
-        --key-delay 0 --key-hold 0 removes ydotool's per-key animation (a long
-        sentence would otherwise take 1-2s to appear); with --file - the 1.x
-        client disables its own escape processing, so _escape_dead_keys stays
-        authoritative. Requires the ydotoold user daemon
-        (scripts/install-ydotoold.sh). wtype is out: GNOME/Mutter lacks the
-        virtual-keyboard Wayland protocol.
-
-        X11 (xdotool type): injects through XTEST -- instant, no daemon, no
-        clipboard. --delay 0 disables xdotool's inter-key delay.
-
-        Backend AND dead-key escaping are decided at runtime, so the same code
-        runs unchanged on the Wayland desktop and the X11 laptop.
-        """
-        backend = _detect_display_server()
-        out_text = _escape_dead_keys(text) if _layout_uses_dead_keys() else text
-        # Diagnostics: dropped/misrouted keystrokes (a whole segment silently not
-        # landing) leave NO error -- the subprocess returns 0 but the compositor
-        # dropped the keys. Log enough to correlate a future drop: char/byte
-        # count, elapsed time, return code, stderr, and the focused client.
-        n_chars = len(out_text)
-        n_bytes = len(out_text.encode("utf-8"))
-        client = getattr(self, "_focus_client", "?")
-        LOG_MSG.info("Inject START backend=%s chars=%d bytes=%d client=%s text=%r",
-                     backend, n_chars, n_bytes, client,
-                     out_text[:80] + ("…" if n_chars > 80 else ""))
-        t0 = time.monotonic()
-        try:
-            if backend == "wayland":
-                proc = subprocess.run(
-                    ["ydotool", "type", "--key-delay", "0",
-                     "--key-hold", "0", "--file", "-"],
-                    input=out_text.encode("utf-8"), timeout=10,
-                    capture_output=True)
-            else:
-                proc = subprocess.run(
-                    ["xdotool", "type", "--clearmodifiers", "--delay", "0",
-                     "--", out_text], timeout=10, capture_output=True)
-            elapsed = time.monotonic() - t0
-            stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()
-            rate = (n_chars / elapsed) if elapsed > 0 else 0.0
-            level = LOG_MSG.warning if (proc.returncode != 0 or stderr) else LOG_MSG.info
-            level("Inject DONE backend=%s rc=%d chars=%d in %.3fs (%.0f ch/s)%s",
-                  backend, proc.returncode, n_chars, elapsed, rate,
-                  (" stderr=%r" % stderr) if stderr else "")
-        except subprocess.TimeoutExpired:
-            LOG_MSG.error("Inject TIMEOUT backend=%s after %.1fs chars=%d -- "
-                          "keystrokes likely partially dropped", backend,
-                          time.monotonic() - t0, n_chars)
-        except FileNotFoundError as e:
-            LOG_MSG.error(
-                "Text-injection tool missing for %s backend (%s). "
-                "On Wayland run scripts/install-ydotoold.sh; on X11 install "
-                "xdotool. Override with STT_INJECT_BACKEND.",
-                backend, e)
-        except Exception as e:
-            LOG_MSG.error("Text injection failed (%s backend): %s", backend, e)
-
     def _final_formatted_text(self, text_process, utterance):
         if self._preediting == True:
             # Don't call this if there was no preediting before
@@ -844,9 +673,11 @@ class STTEngine(IBus.Engine):
             # utterance is not glued onto it.
             if paste_text and paste_text[-1] in '.?!':
                 paste_text = paste_text + ' '
-            # Inject via the backend appropriate to the running display server
-            # (ydotool on Wayland, xdotool+clipboard on X11). See _inject_text.
-            self._inject_text(paste_text)
+            # Commit through the IBus input-method protocol -- display-server
+            # agnostic (works on X11 and Wayland), no daemon/clipboard/uinput,
+            # and inserts the literal string so the keyboard layout's dead keys
+            # never apply. Preedit was already cleared above.
+            self.commit_text(IBus.Text.new_from_string(paste_text))
             self._left_text+=paste_text
             self._left_text_reset=False
             LOG_MSG.debug("current left text (after commit) (%s)", self._left_text)
@@ -926,16 +757,3 @@ class STTEngine(IBus.Engine):
 
         # We need to chain this function if we want get_surrounding_text to work
         IBus.Engine.do_set_surrounding_text(self, ibus_text, cursor_pos, anchor_pos)
-
-
-if __name__ == "__main__":
-    # Self-check: dead-key escaping must fire for real intl layouts but NOT for
-    # alt-intl (where ' and " are normal keys), which was typing  that's  as
-    # that' s . Regression guard for _blob_indicates_dead_keys.
-    assert _blob_indicates_dead_keys("layout: us\nvariant: intl,")        # us-intl
-    assert _blob_indicates_dead_keys("X11 Variant: intl")
-    assert not _blob_indicates_dead_keys("layout: us,us\nvariant: alt-intl,")  # the bug
-    assert not _blob_indicates_dead_keys("layout: us\nvariant: ,")        # plain us
-    assert _escape_dead_keys("that's") == "that' s"   # escaping itself unchanged
-    assert _escape_dead_keys("plain") == "plain"
-    print("sttengine dead-key self-check OK")
