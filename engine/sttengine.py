@@ -84,6 +84,7 @@ class STTEngine(IBus.Engine):
         self._left_text_reset=True
         # Last focused IBus client name, for injection diagnostics.
         self._focus_client="?"
+        self._partials_active=None
 
         self._preediting=False
 
@@ -215,7 +216,7 @@ class STTEngine(IBus.Engine):
         self._engine.connect("state-changed", self._state_changed)
         self._engine.connect("text", self._got_text)
         self._engine.connect("partial-text", self._got_partial_text)
-        self._engine.set_use_partial_results(self._preedit_text)
+        self._update_partial_usage()
         self._engine_connected=True
 
     def do_destroy (self):
@@ -246,7 +247,25 @@ class STTEngine(IBus.Engine):
 
     def _update_preedit_text(self):
         self._preedit_text=self._settings.get_boolean("preedit-text")
-        self._engine.set_use_partial_results(self._preedit_text)
+        self._update_partial_usage()
+
+    def _update_partial_usage(self):
+        """Stream partials (preedit) only when the user enabled them AND the
+        focused client can actually render preedit.
+
+        A client that does NOT advertise PREEDIT_TEXT makes IBus COMMIT every
+        preedit update as permanent text, so each streamed partial gets pasted in
+        full -- the "spoke once, printed 2-3x" duplication (prefix, then fuller,
+        then final, all committed). For those clients we stream nothing and commit
+        only the final result."""
+        can_preedit = bool(self.client_capabilities & IBus.Capabilite.PREEDIT_TEXT)
+        use_partials = bool(self._preedit_text and can_preedit)
+        if use_partials != self._partials_active:
+            LOG_MSG.info("partials %s (preedit-setting=%s client-preedit=%s) "
+                         "client=%s", "ON" if use_partials else "OFF",
+                         self._preedit_text, can_preedit, self._focus_client)
+            self._partials_active = use_partials
+        self._engine.set_use_partial_results(use_partials)
 
     def _on_preedit_text_changed(self, settings, key):
         self._update_preedit_text()
@@ -534,6 +553,14 @@ class STTEngine(IBus.Engine):
         self._engine.stop()
         self._disconnect_from_engine()
 
+    def do_set_capabilities(self, caps):
+        # CHAIN first so self.client_capabilities is updated by the base class,
+        # then re-decide whether this client can take streamed partials. Caps are
+        # often set right after focus-in, so this is where the preedit capability
+        # for the new client actually becomes known.
+        IBus.Engine.do_set_capabilities(self, caps)
+        self._update_partial_usage()
+
     def do_focus_in(self):
         LOG_MSG.debug("focus in")
         self.do_focus_in_id("", "")
@@ -555,6 +582,10 @@ class STTEngine(IBus.Engine):
             self._text_processor.supports_shortcuts=True
         else:
             self._text_processor.supports_shortcuts=False
+
+        # Re-decide partials for the newly focused client (caps may already be
+        # known from a prior identical client without a fresh set_capabilities).
+        self._update_partial_usage()
 
         # With recent gtk versions the "focus-in" is not always preceded by a
         # "reset" signal. Mainly when switching to a gtk4 window with no text.
