@@ -281,7 +281,14 @@ class STTGstWhisper(STTGstBase):
 
         if VAD_MODULE_OK:
             self._vad = STTVad(
-                speech_threshold=0.5,
+                # 0.6 (was 0.5): a running fan reads as speech at 0.5 and feeds
+                # noise to whisper, which hallucinates words from it. Real speech
+                # scores ~0.83 at onset, so 0.6 rejects steady noise with margin
+                # to spare. ponytail: tunable noise gate -- if the fan still
+                # leaks, watch DEBUG "speech onset (confidence=...)" lines for the
+                # noise's actual score and set this just above it (0.65/0.7);
+                # lower it back toward 0.5 if quiet speech starts getting missed.
+                speech_threshold=0.6,
                 # 800ms: the user's chosen optimum between snappy finalize and
                 # stitching short mid-thought pauses. This silence window is the
                 # only felt delay now that injection is instant (ydotoold +
