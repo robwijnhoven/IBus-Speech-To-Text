@@ -136,13 +136,22 @@ TAIL_PROMPT_WORDS   = 20
 # fallback. A phrase repeated more than this many times in a row is trimmed
 # back to this many copies. Raise if it ever clips legitimate speech.
 MAX_PHRASE_REPEAT   = 2
+# A short phrase can legitimately repeat ("no no", "very very good"), so those
+# are only trimmed once they run away (> MAX_PHRASE_REPEAT). But a phrase this
+# many words or longer repeated even ONCE is a decode artefact, never real
+# speech -- a whole sentence committed twice, or a streamed-partial/tail seam
+# overlap. Those collapse to a single copy. ponytail: word-count heuristic; bump
+# it if it ever clips a genuinely repeated long phrase.
+LONG_PHRASE_NGRAM   = 4
 
 
-def _collapse_repetitions(text, keep=MAX_PHRASE_REPEAT, max_ngram=10):
+def _collapse_repetitions(text, keep=MAX_PHRASE_REPEAT, max_ngram=25):
     """Trim runaway Whisper repetition loops.
 
-    A phrase of up to ``max_ngram`` words that repeats more than ``keep`` times
-    in a row is reduced to ``keep`` copies. Words are compared
+    A short phrase that repeats more than ``keep`` times in a row is reduced to
+    ``keep`` copies; a phrase of ``LONG_PHRASE_NGRAM`` words or more repeated
+    even twice collapses to a single copy (whole-sentence doubling is never real
+    speech). Phrases up to ``max_ngram`` words are considered. Words are compared
     case-insensitively and ignoring surrounding punctuation, but the original
     tokens are preserved in the output. Ordinary short repeats survive.
     """
@@ -171,8 +180,9 @@ def _collapse_repetitions(text, keep=MAX_PHRASE_REPEAT, max_ngram=10):
             while j + n <= n_words and keys[j:j + n] == gram:
                 reps += 1
                 j += n
-            if reps > keep:
-                out.extend(words[i:i + n * keep])
+            limit = 1 if n >= LONG_PHRASE_NGRAM else keep
+            if reps > limit:
+                out.extend(words[i:i + n * limit])
                 i = j
                 matched = True
                 collapsed_any = True
@@ -952,3 +962,27 @@ class STTGstWhisper(STTGstBase):
     def _stop_real(self):
         self.get_final_results()
         return super()._stop_real()
+
+
+if __name__ == "__main__":
+    # Self-check for the repetition guard (pure function, no audio/model).
+    # Run: python sttgstwhisper.py
+    c = _collapse_repetitions
+    # The reported bug: a whole sentence committed twice must collapse to one.
+    assert c("disable it in my other PC disable it in my other PC") \
+        == "disable it in my other PC", "long 2x repeat not collapsed"
+    # Long collapse is case/punctuation-insensitive but keeps original tokens.
+    assert c("Disable it in my PC. disable it in my PC.") \
+        == "Disable it in my PC.", "long 2x repeat (mixed case) not collapsed"
+    # Known limitation: a SHORT phrase doubled exactly twice is allowed through
+    # (so "no no", "bye bye" survive); the streamed+tail seam can still double a
+    # short phrase. Documented, not a regression.
+    assert c("thank you thank you") == "thank you thank you"
+    # Short legitimate doubles survive (<= keep copies of a short phrase).
+    assert c("no no") == "no no", "short double wrongly collapsed"
+    assert c("very very good") == "very very good", "short double wrongly collapsed"
+    # Runaway short loop still trims to keep (=2) copies.
+    assert c("hi hi hi hi hi") == "hi hi", "short runaway not trimmed"
+    # A genuine long phrase that does NOT repeat is left untouched.
+    assert c("the quick brown fox jumps") == "the quick brown fox jumps"
+    print("sttgstwhisper self-check: OK")
