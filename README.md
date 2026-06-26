@@ -98,8 +98,12 @@ What differs from upstream on this branch:
   otherwise only the uncovered tail is decoded — and that tail decode is fed the
   last `TAIL_PROMPT_WORDS` of streamed text as `initial_prompt` so a trailing
   word continues the sentence (no spurious `"Better."` capitalisation) and a
-  filler-only tail (`"Thank you."`, `"um."`) is dropped. See `CLAUDE.md`
-  "Latency architecture" for the full rationale.
+  filler-only tail (`"Thank you."`, `"um."`) is dropped. The short tail re-decode
+  usually re-hears the streamed text's last word(s), so it is overlap-merged onto
+  the streamed text (`_merge_streamed_tail`, quote/case/punct-insensitive) — this
+  kills the seam duplication (`...the script. The script.`) that
+  `_collapse_repetitions` can't touch without also eating real doubles like
+  `"no no"`. See `CLAUDE.md` "Latency architecture" for the full rationale.
 
 Contributing to the fork
 =========================

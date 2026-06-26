@@ -72,9 +72,16 @@ PARTIAL_DECODE_CAP_S = 12.0
 MIN_SEGMENT_PROB    = 0.35
 
 
+# Punctuation/quotes stripped when comparing word identity across decodes.
+# Quotes are included so a streamed `"thank` / `you"` matches a tail `Thank` /
+# `you.` -- without that the streamed+tail seam can't see the overlap and
+# duplicates it.
+_WORD_STRIP = ".,!?;:…—-\"'“”‘’"
+
+
 def _word_key(w):
     """Normalise a word for agreement comparison (case/punctuation-insensitive)."""
-    return w.strip(".,!?;:…—-").lower()
+    return w.strip(_WORD_STRIP).lower()
 
 
 def _common_prefix_len(a, b):
@@ -115,6 +122,21 @@ def _new_tail_after_agreed(decode_words, agreed_words, max_overlap=40):
             d_keys[:len(a_keys)] == a_keys:
         return decode_words[len(agreed_words):]
     return decode_words
+
+
+def _merge_streamed_tail(streamed_text, tail_words):
+    """Append tail words to streamed text, dropping any leading tail words that
+    duplicate the trailing streamed words.
+
+    The streamed+tail finalize re-decodes only the last ~1s, so whisper usually
+    re-hears the final word(s): streamed 'say "thank you"' + tail 'Thank you'
+    must merge to '...thank you', NOT '...thank you Thank you'. Overlap is matched
+    case/punctuation/quote-insensitively (via _new_tail_after_agreed), so a true
+    continuation ('say thank' + 'thank you' -> 'say thank you') is preserved
+    while a pure re-hear collapses to nothing.
+    """
+    new_tail = _new_tail_after_agreed(tail_words, streamed_text.split())
+    return (streamed_text + " " + " ".join(new_tail)).strip()
 # Option 1: promote the last partial as the final result (skip the redundant
 # full re-decode) when that partial already covered at least this fraction of
 # the finalized segment AND the uncovered tail is shorter than
@@ -635,8 +657,10 @@ class STTGstWhisper(STTGstBase):
                     if tail_text and tail_text.lower() in _HALLUCINATIONS:
                         LOG_MSG.info("Dropped hallucinated tail: '%s'", tail_text)
                         tail_words = []
-                    text = (partial_text.strip() + " "
-                            + ' '.join(tail_words)).strip()
+                    # Drop leading tail words that just re-hear the end of the
+                    # streamed text (the seam-duplication bug); _collapse_repetitions
+                    # can't, since it must let short doubles like "no no" through.
+                    text = _merge_streamed_tail(partial_text.strip(), tail_words)
                     text = _collapse_repetitions(text)
                     if text and text.lower() not in _HALLUCINATIONS:
                         if text[-1] not in '.?!':
@@ -974,10 +998,26 @@ if __name__ == "__main__":
     # Long collapse is case/punctuation-insensitive but keeps original tokens.
     assert c("Disable it in my PC. disable it in my PC.") \
         == "Disable it in my PC.", "long 2x repeat (mixed case) not collapsed"
-    # Known limitation: a SHORT phrase doubled exactly twice is allowed through
-    # (so "no no", "bye bye" survive); the streamed+tail seam can still double a
-    # short phrase. Documented, not a regression.
+    # A SHORT phrase doubled exactly twice is allowed through here (so "no no",
+    # "bye bye" survive); the streamed+tail seam doubling is killed earlier, by
+    # _merge_streamed_tail, NOT by the collapse pass.
     assert c("thank you thank you") == "thank you thank you"
+
+    # Seam merge: the reported fan-on bug. A tail that just re-hears the end of
+    # the streamed text must collapse to nothing, even across quotes/case/punct.
+    m = _merge_streamed_tail
+    assert m('So I want to say "thank you"', ["Thank", "you."]) \
+        == 'So I want to say "thank you"', "seam re-hear not deduped"
+    assert m("rerun the script", ["the", "script."]) \
+        == "rerun the script", "seam re-hear (no quotes) not deduped"
+    # A genuine continuation that overlaps by one word keeps the new words.
+    assert m("I want to say thank", ["thank", "you"]) \
+        == "I want to say thank you", "continuation wrongly dropped"
+    # No overlap: the whole tail is appended.
+    assert m("the cat sat", ["on", "the", "mat"]) \
+        == "the cat sat on the mat", "non-overlapping tail dropped"
+    # Empty tail (e.g. hallucinated tail already cleared) leaves streamed as-is.
+    assert m("hello world", []) == "hello world", "empty tail changed text"
     # Short legitimate doubles survive (<= keep copies of a short phrase).
     assert c("no no") == "no no", "short double wrongly collapsed"
     assert c("very very good") == "very very good", "short double wrongly collapsed"
