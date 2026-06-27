@@ -397,6 +397,12 @@ class STTGstWhisper(STTGstBase):
 
             if lang_code:
                 kwargs["language"] = lang_code
+                LOG_MSG.info("Whisper language fixed to '%s' (locale %s)",
+                             lang_code, self._current_locale.locale)
+            else:
+                LOG_MSG.warning("No Whisper language code (locale %s) - "
+                                "auto-detect; may pick the wrong language",
+                                self._current_locale.locale if self._current_locale else None)
 
             self._whisper = Model(model_path, **kwargs)
             return True
