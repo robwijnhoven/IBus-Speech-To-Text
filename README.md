@@ -77,6 +77,36 @@ It might seem obvious but the quality of the microphone used largely influences 
 
 This Input Method can also be enabled and disabled with the default shorcut ("Win + Space") used to switch between IBus Input Methods. By default, when IBus STT is enabled, voice recognition is not started immediately but there is a setting to change this behaviour. If enabled, you can start and stop voice recognition with the above shortcut.
 
+Restart on resume from suspend (GPU users)
+==========================================
+
+If you run the engine on the GPU (this fork's whisper.cpp path), a deep-sleep
+suspend can leave the GPU context behind the in-VRAM model in a degraded state.
+Whisper keeps decoding against it with no reload or error, and because the
+language parameter is only a soft bias the output drifts to the **wrong
+language** (we hit this as English dictation coming out as Dutch after resume).
+
+The fix is a one-time `ibus restart`, which reloads the model into a fresh GPU
+context. To do that automatically on every resume, install the provided
+`system-sleep` hook:
+
+```
+sudo install -m 755 scripts/ibus-stt-resume /usr/lib/systemd/system-sleep/ibus-stt-resume
+```
+
+Test it without an actual suspend (it should restart IBus — the mic indicator
+goes off and back on):
+
+```
+sudo /usr/lib/systemd/system-sleep/ibus-stt-resume post suspend
+```
+
+`scripts/ibus-stt-resume` auto-detects the active graphical user (no hardcoded
+username) and runs `ibus restart` in that session on resume. It must be a
+**system** `system-sleep` script, *not* a `systemd --user` unit: systemd only
+propagates `suspend.target` into the user manager from v256 onwards, so on older
+systemd a user unit bound to it enables but never fires.
+
 Fork notes (`sst-local`)
 ========================
 
