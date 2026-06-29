@@ -1,0 +1,42 @@
+#!/bin/sh
+# systemd system-sleep hook: restart IBus after resume so the STT whisper model
+# reloads into a fresh GPU context.
+#
+# Why: deep sleep suspends the GPU. The GPU context behind the VRAM-resident
+# whisper model comes back degraded on resume, and whisper keeps decoding against
+# it with no reload or error. Because the language param is only a soft bias
+# (not a hard lock), a degraded context drifts to the wrong language (observed:
+# English dictation coming out as Dutch). `ibus restart` reloads the model into a
+# fresh GPU context and fixes it.
+#
+# Install (as root):
+#   install -m 755 ibus-stt-resume /usr/lib/systemd/system-sleep/ibus-stt-resume
+# Test without a real suspend:
+#   sudo /usr/lib/systemd/system-sleep/ibus-stt-resume post suspend
+#
+# Note: this MUST be a system `system-sleep` script, not a `systemd --user` unit.
+# systemd only propagates sleep.target/suspend.target into the user manager from
+# v256 on; on older systemd a user unit bound to suspend.target enables but never
+# fires. This script runs as root on resume and re-enters the active graphical
+# session to run `ibus restart` as that user.
+
+# system-sleep runs the script twice: "pre"/suspend before sleep, "post"/suspend
+# after resume. Only act on resume.
+[ "$1" = "post" ] || exit 0
+
+# Find the active graphical session's user (don't hardcode a username/uid).
+user=$(loginctl list-sessions --no-legend 2>/dev/null \
+    | awk '{print $3}' | sort -u \
+    | while read -r u; do
+        [ -n "$u" ] || continue
+        [ "$(loginctl show-user "$u" -p State --value 2>/dev/null)" = "active" ] && echo "$u" && break
+      done)
+[ -n "$user" ] || exit 0
+uid=$(id -u "$user") || exit 0
+
+runuser -u "$user" -- env \
+    XDG_RUNTIME_DIR="/run/user/$uid" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+    DISPLAY="${DISPLAY:-:0}" \
+    WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+    ibus restart
