@@ -1,9 +1,10 @@
 # IBus Speech To Text Input Method
 
-> **Fork note (`sst-local` branch).** This fork replaces VOSK with **whisper.cpp**
-> (`large-v3-turbo`, GPU-accelerated via ROCm) and adds live streaming partials,
-> a context-fed tail decode, and runtime display-server detection for text
-> injection. The "Description" / "Dependencies" sections below are inherited from
+> **Fork note (`sst-local` branch).** This fork replaces VOSK with two modern
+> backends — **whisper.cpp** (`large-v3-turbo`) and **Parakeet** (NVIDIA
+> Parakeet-TDT via onnx-asr, now the preferred default because it does not
+> hallucinate on noise) — and adds live streaming partials, a context-fed tail
+> decode, and runtime display-server detection for text injection. The "Description" / "Dependencies" sections below are inherited from
 > upstream and describe the original VOSK design; see **Fork notes** at the bottom
 > for what actually differs here. Operational/engineering detail (tuning knobs,
 > latency architecture, runtime layout) lives in the project-root `CLAUDE.md`,
@@ -112,6 +113,21 @@ Fork notes (`sst-local`)
 
 What differs from upstream on this branch:
 
+- **Parakeet backend (preferred).** A third ASR backend, selectable via the
+  `backend` GSetting (`vosk` | `whisper` | `parakeet`) or the Preferences "Speech
+  engine" radio. `engine/sttgstparakeet.py` runs NVIDIA Parakeet-TDT
+  `nemo-parakeet-tdt-0.6b-v3` (multilingual, CC-BY-4.0) via the `onnx_asr`
+  library. It is a *transducer* — it emits blank on silence, so unlike Whisper it
+  does not hallucinate on background/fan noise (Whisper produced stray
+  Japanese/CJK on silence). It therefore drops ALL of the Whisper path's
+  streaming/tail/repetition/hallucination machinery: one VAD segment in, one
+  string out. Runs on **CPU** by default (~18× realtime); install
+  `onnxruntime-gpu` (+ cuDNN) to use CUDA — the backend auto-detects the provider
+  and falls back to CPU. Deps: `pip install onnx-asr huggingface_hub`. The model
+  (~2.4 GB) auto-downloads to `~/.cache/huggingface` on first use — prefetch it
+  with `python download_model.py --parakeet` so the first dictation doesn't stall.
+  VAD tuning in `sttgstparakeet.py`: `silence_duration_ms` (the felt latency
+  before text appears; lower = snappier), `speech_threshold=0.5`.
 - **Engine is whisper.cpp**, not VOSK — `large-v3-turbo`, run on the GPU via
   ROCm. Audio path: PipeWire → GStreamer → Silero VAD → whisper.cpp → keystroke
   injection.
