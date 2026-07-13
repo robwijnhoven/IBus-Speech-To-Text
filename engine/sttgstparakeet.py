@@ -224,23 +224,26 @@ class STTGstParakeet(STTGstBase):
             self._asr_load_failed = True
             return False
         try:
-            # Prefer CUDA when an onnxruntime-gpu build exposes it; always keep
-            # CPU as fallback so a plain onnxruntime install just runs on CPU.
-            # Install onnxruntime-gpu (+ cuDNN) to light up the GPU -- no code
-            # change needed here.
+            # Prefer whichever GPU EP the installed onnxruntime build exposes --
+            # ROCM (AMD, onnxruntime-rocm wheel) or CUDA (NVIDIA, onnxruntime-gpu)
+            # -- and always keep CPU as fallback so a plain onnxruntime install
+            # just runs on CPU. No code change needed to switch GPU vendor: the
+            # launcher sets the right LD_LIBRARY_PATH (ROCm: /opt/rocm/lib +
+            # HSA_OVERRIDE_GFX_VERSION; CUDA: the nvidia-*-cuNN wheel dirs).
             import onnxruntime as _rt
             avail = _rt.get_available_providers()
-            use_cuda = "CUDAExecutionProvider" in avail
-            if use_cuda and hasattr(_rt, "preload_dlls"):
-                # Load CUDA/cuDNN from the nvidia-*-cuNN pip wheels so the CUDA EP
-                # finds libcudnn.so.9 without a manual LD_LIBRARY_PATH. No-op if
-                # the wheels aren't installed -- load then falls back to CPU below.
+            gpu_ep = next((p for p in ("ROCMExecutionProvider",
+                                       "CUDAExecutionProvider") if p in avail), None)
+            if gpu_ep == "CUDAExecutionProvider" and hasattr(_rt, "preload_dlls"):
+                # CUDA only: load cuDNN/cublas from the nvidia-*-cuNN pip wheels.
+                # ROCm libs come via LD_LIBRARY_PATH from the launcher instead.
                 try:
                     _rt.preload_dlls()
                 except Exception as e:
                     LOG_MSG.debug("onnxruntime.preload_dlls() failed: %s", e)
-            providers = (["CUDAExecutionProvider"] if use_cuda else []) \
-                        + ["CPUExecutionProvider"]
+            providers = ([gpu_ep] if gpu_ep else []) + ["CPUExecutionProvider"]
+            _gpu_label = {"ROCMExecutionProvider": "ROCm",
+                          "CUDAExecutionProvider": "CUDA"}.get(gpu_ep, "CPU")
             _qlabel = QUANTIZATION or "fp32"
             LOG_MSG.info("Loading Parakeet model: %s (providers=%s, quant=%s; "
                          "first run downloads it to the HF cache)",
@@ -248,7 +251,7 @@ class STTGstParakeet(STTGstBase):
             try:
                 self._asr = onnx_asr.load_model(
                     PARAKEET_MODEL, quantization=QUANTIZATION, providers=providers)
-                self._provider_label = f"{'CUDA' if use_cuda else 'CPU'}/{_qlabel}"
+                self._provider_label = f"{_gpu_label}/{_qlabel}"
             except Exception as gpu_err:
                 # A half-configured GPU (e.g. onnxruntime-gpu without cuDNN) can
                 # throw at session creation. Don't let that kill the backend --

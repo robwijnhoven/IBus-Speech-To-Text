@@ -5,5 +5,9 @@ __pycache__/
 # Meson build directory
 /builddir/
 
+# install.sh creates these inside the repo (venv + downloaded models)
+/venv/
+/models/
+
 # MemSearch plugin data (not project code)
 .memsearch/

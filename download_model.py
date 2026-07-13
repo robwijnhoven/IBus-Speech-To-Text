@@ -12,7 +12,36 @@
 # looks:  venv/bin/python IBus-Speech-To-Text/download_model.py --parakeet
 
 import argparse
+import glob
+import os
 import sys
+
+
+def _ensure_cuda_libpath():
+    """Put the nvidia-*-cuNN pip-wheel lib dirs on LD_LIBRARY_PATH, then re-exec.
+
+    onnxruntime-gpu links libcudart.so.NN which lives under the venv's
+    site-packages/nvidia/*/lib wheels, NOT on the default loader path. Its own
+    preload_dlls() can't rescue this: `import onnxruntime` raises at import time
+    (before any call is possible). LD_LIBRARY_PATH is read only at exec, so we
+    set it and re-exec ourselves once. No-op on CPU-only installs (no wheels).
+    """
+    if os.environ.get("_STT_CUDA_LIBPATH_SET"):
+        return  # already re-exec'd once; avoid a loop
+    sp = os.path.join(os.path.dirname(os.path.dirname(sys.executable)),
+                      "lib", f"python{sys.version_info.major}.{sys.version_info.minor}",
+                      "site-packages")
+    libdirs = sorted({os.path.dirname(p)
+                      for p in glob.glob(os.path.join(sp, "nvidia", "*", "lib", "*.so*"))})
+    if not libdirs:
+        return  # CPU-only install, nothing to add
+    ld = os.environ.get("LD_LIBRARY_PATH", "")
+    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(libdirs + ([ld] if ld else []))
+    os.environ["_STT_CUDA_LIBPATH_SET"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_cuda_libpath()
 
 PARAKEET_MODEL        = "nemo-parakeet-tdt-0.6b-v3"   # multilingual, CC-BY-4.0
 WHISPER_REPO          = "ggerganov/whisper.cpp"
