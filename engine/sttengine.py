@@ -82,6 +82,12 @@ class STTEngine(IBus.Engine):
 
         self._left_text=""
         self._left_text_reset=True
+        # ponytail: committing text through IBus while a modifier (Shift/Ctrl/
+        # Alt/Super) is physically held makes GNOME/Mutter lose that modifier's
+        # release event -- the app stays "Shift down" (e.g. after Shift+Tab then
+        # talking). We defer the finalize commit until every modifier is up.
+        self._pending_commit=None
+        self._mods_held=False
         # Last focused IBus client name, for injection diagnostics.
         self._focus_client="?"
         self._partials_active=None
@@ -708,10 +714,22 @@ class STTEngine(IBus.Engine):
             # agnostic (works on X11 and Wayland), no daemon/clipboard/uinput,
             # and inserts the literal string so the keyboard layout's dead keys
             # never apply. Preedit was already cleared above.
-            self.commit_text(IBus.Text.new_from_string(paste_text))
-            self._left_text+=paste_text
-            self._left_text_reset=False
-            LOG_MSG.debug("current left text (after commit) (%s)", self._left_text)
+            #
+            # But NOT while a modifier is physically held: an IBus commit that
+            # lands between a modifier's press and release makes GNOME/Mutter
+            # drop the release, leaving the app stuck "Shift/Ctrl/Caps down".
+            # Stash it and flush on the modifier-release in do_process_key_event.
+            if self._mods_held == True:
+                self._pending_commit=(self._pending_commit or "")+paste_text
+                LOG_MSG.debug("commit deferred (modifier held): %r", paste_text)
+            else:
+                self._commit(paste_text)
+
+    def _commit(self, paste_text):
+        self.commit_text(IBus.Text.new_from_string(paste_text))
+        self._left_text+=paste_text
+        self._left_text_reset=False
+        LOG_MSG.debug("current left text (after commit) (%s)", self._left_text)
 
     def _got_partial_text(self, engine, utterance):
         if self._format_preedit == True:
@@ -741,8 +759,38 @@ class STTEngine(IBus.Engine):
         # if self._engine.is_running() == True:
         #     self.commit_text(IBus.Text.new_from_string(""))
 
+    # Modifiers whose press/release we must not straddle with an IBus commit.
+    # LOCK_MASK (Caps Lock) is deliberately excluded: its bit reflects the
+    # latched on/off state, not a physical hold, so including it would keep
+    # _mods_held true for every keystroke while Caps is ON and defer commits
+    # forever. Caps release is still handled below (keyval Caps_Lock -> mods=0).
+    _MOD_MASK=(IBus.ModifierType.SHIFT_MASK
+               | IBus.ModifierType.CONTROL_MASK
+               | IBus.ModifierType.MOD1_MASK      # Alt
+               | IBus.ModifierType.SUPER_MASK)
+
     def do_process_key_event(self, keyval, keycode, state):
-        if (state & IBus.ModifierType.RELEASE_MASK) != 0:
+        # Track whether any modifier is physically held. IBus reports the
+        # modifier state *before* this event is applied, so on the modifier's
+        # own release the bit is still set -- clear it for that keyval.
+        is_release=(state & IBus.ModifierType.RELEASE_MASK) != 0
+        mods=state & self._MOD_MASK
+        if is_release and keyval in (
+                IBus.KEY_Shift_L, IBus.KEY_Shift_R,
+                IBus.KEY_Control_L, IBus.KEY_Control_R,
+                IBus.KEY_Alt_L, IBus.KEY_Alt_R,
+                IBus.KEY_Super_L, IBus.KEY_Super_R,
+                IBus.KEY_Caps_Lock):
+            mods=0
+        self._mods_held=(mods != 0)
+        # Modifiers just went fully up: flush any commit we held back.
+        if self._mods_held == False and self._pending_commit is not None:
+            paste_text=self._pending_commit
+            self._pending_commit=None
+            LOG_MSG.debug("flushing deferred commit: %r", paste_text)
+            self._commit(paste_text)
+
+        if is_release:
             if self._stop_on_key_pressed == True:
                 # Stop transcribing on keypress, but keep capturing (meter live).
                 self._set_recognizing(False)
