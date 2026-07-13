@@ -26,6 +26,7 @@ from sttutils import *
 
 from sttgstvosk import STTGstVosk
 from sttgstwhisper import STTGstWhisper
+from sttgstparakeet import STTGstParakeet
 
 LOG_MSG=logging.getLogger()
 
@@ -51,6 +52,9 @@ class STTGstFactory(GObject.GObject):
             if backend == "whisper":
                 LOG_MSG.info("Using Whisper backend")
                 engine=STTGstWhisper()
+            elif backend == "parakeet":
+                LOG_MSG.info("Using Parakeet backend")
+                engine=STTGstParakeet()
             else:
                 LOG_MSG.info("Using Vosk backend")
                 engine=STTGstVosk()
