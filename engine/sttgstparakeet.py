@@ -137,12 +137,12 @@ class STTGstParakeet(STTGstBase):
             # noise ever produces stray words (it shouldn't, given the model).
             self._vad = STTVad(
                 speech_threshold=0.5,
-                # 800ms: user prefers longer pauses (can pause mid-thought
-                # without the utterance finalizing). Parakeet decodes in ~tens of
-                # ms (faster still on GPU), so total latency after you stop is
-                # basically this window. ponytail: lower toward 500/400 if you
-                # want snappier finalize at the cost of shorter tolerated pauses.
-                silence_duration_ms=800,
+                # 500ms: snappier finalize. User's mid-thought pauses stay
+                # under ~0.5s, and a longer stop is usually a new sentence
+                # anyway. Parakeet decodes in ~tens of ms, so total latency
+                # after you stop is basically this window. ponytail: back to
+                # 800 if short pauses start finalizing mid-thought.
+                silence_duration_ms=500,
                 speech_pad_ms=200,
                 min_speech_duration_ms=300,
                 max_speech_duration_s=30.0,
