@@ -73,16 +73,12 @@ PARAKEET_MODEL = "nemo-parakeet-tdt-0.6b-v3"
 # without losing GPU speed you'd need fp16 (offline conversion); or just run on CPU
 # (same speed as int8-on-GPU, zero VRAM).
 QUANTIZATION = None
-# The GPU on this box is a 4GB laptop card that ALSO drives the Wayland desktop
-# (gnome-shell). The fp32 model holds ~3.5GB of the 4GB VRAM, so each decode's
-# working buffers tip it over: the driver stalls the GPU migrating VRAM to system
-# RAM, and because the compositor shares that GPU the WHOLE desktop freezes for
-# ~2-3s per utterance. Decode is only ~100ms of that -- the freeze is VRAM
-# contention, not compute. CPU decode is ~same speed as int8-on-GPU, uses zero
-# VRAM, and can't stall the compositor. Decode was never the felt latency (the
-# silence window is), so nothing noticeable is lost. ponytail: flip True only on a
-# discrete GPU that isn't driving the display, or after converting to fp16.
-USE_GPU = False
+# GPU decode works fine here (CUDA/fp32, ~100ms/utterance) -- leave it on.
+# NB: a periodic ~12s whole-desktop freeze was briefly misattributed to GPU VRAM
+# contention from this backend; the real cause was unrelated -- the V-Shell
+# (vertical-workspaces) GNOME extension saturating the compositor's main thread.
+# CPU also works (~same speed as int8-on-GPU, zero VRAM) if you ever want it.
+USE_GPU = True
 # Ignore VAD segments shorter than this -- nothing useful in a sub-200ms blip.
 MIN_SEGMENT_S = 0.2
 
