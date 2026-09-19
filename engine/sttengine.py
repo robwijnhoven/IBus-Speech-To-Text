@@ -669,11 +669,10 @@ class STTEngine(IBus.Engine):
 
     def _shortcut(self, text_process, keyval, modifiers):
         if self._preediting == True:
-            # Don't call this if there was no preediting before
-            self.update_preedit_text_with_mode(IBus.Text.new_from_string(""),
-                                               0,
-                                               True,
-                                               IBus.PreeditFocusMode.CLEAR)
+            # Same reason as in _final_formatted_text: end the composition
+            # explicitly. Extra bite here -- a key event forwarded while a
+            # client still thinks it is composing gets eaten by the IME.
+            self.hide_preedit_text()
             self._preediting=False
 
         self.forward_key_event(keyval, 0, modifiers)
@@ -681,8 +680,12 @@ class STTEngine(IBus.Engine):
     def _add_preedit_text(self, utterance):
         # Note: we accept "" (in case we need to remove previous partial text)
         ibus_text=IBus.Text.new_from_string(utterance)
+        # cursor_pos is the caret offset inside the preedit; keep it at the end
+        # so the caret trails the streamed text instead of sitting at its start.
+        # Counted in characters, not bytes: IBus.Text cursor_pos is a character
+        # offset, so a non-ASCII partial would otherwise overshoot.
         self.update_preedit_text_with_mode(ibus_text,
-                                           0,
+                                           len(utterance),
                                            True,
                                            IBus.PreeditFocusMode.CLEAR)
         self._preediting=True
@@ -692,11 +695,22 @@ class STTEngine(IBus.Engine):
 
     def _final_formatted_text(self, text_process, utterance):
         if self._preediting == True:
-            # Don't call this if there was no preediting before
-            self.update_preedit_text_with_mode(IBus.Text.new_from_string(""),
-                                               0,
-                                               True,
-                                               IBus.PreeditFocusMode.CLEAR)
+            # Tear the composition down with hide_preedit_text(), NOT with an
+            # empty update_preedit_text_with_mode(...CLEAR).
+            #
+            # Both end the preedit, but the empty-update form leaves Chromium
+            # holding an *active but empty* composition: the commit_text() that
+            # follows is a separate D-Bus message, so Blink re-enters composing
+            # state for the inserted run and paints it as a composition --
+            # the green/highlighted block seen in browser chat inputs
+            # (DeepSeek). The next utterance's first preedit then replaces that
+            # still-composing run, which is why continuing to speak wiped the
+            # text that had just landed. GTK and terminals drop an empty
+            # composition outright, so they never showed it.
+            #
+            # hide_preedit_text() ends composition explicitly, so the commit
+            # that follows is ordinary text insertion with no composing range.
+            self.hide_preedit_text()
             self._preediting=False
 
         # Note : there could be text to write even after cancellation ("cancel
