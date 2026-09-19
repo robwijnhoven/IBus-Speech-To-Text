@@ -82,6 +82,28 @@ USE_GPU = True
 # Ignore VAD segments shorter than this -- nothing useful in a sub-200ms blip.
 MIN_SEGMENT_S = 0.2
 
+# Live preview: re-decode the in-progress utterance every N seconds and show it
+# as IBus preedit, so the silence_duration_ms wait is not dead air. The preview
+# is PREVIEW ONLY -- finalize still does the authoritative full-segment decode,
+# so committed text is byte-identical to the no-partials path. That is the whole
+# reason this is safe on a transducer: no promotion, no tail-splicing, no
+# hallucination guards to port from the Whisper backend.
+# 0.8s tick: fast enough that text visibly tracks speech, slow enough that a
+# long utterance costs a handful of decodes. NOTE each tick re-decodes the
+# WHOLE utterance so far (not just the new audio), so cost grows with utterance
+# length: measured 99ms at 4s, 376ms at 14s on ROCm. Still cheap at RTF ~0.02,
+# but it is not a constant-cost stream.
+# The final full decode is therefore often redundant -- on a 16s utterance the
+# last partial matched the final byte-for-byte and the final still cost 567ms.
+# Skipping it (cf. _maybe_promote_partial in the Whisper backend) is the next
+# real latency win; deliberately not done here to keep committed text
+# authoritative.
+# NOTE: the laptop has no measured decode timings yet -- if its RTF is much
+# worse, set this back to None there rather than letting ticks pile up.
+# ponytail: a plain constant, not a gsetting -- promote to config only if the
+# two machines need different values.
+PARTIAL_INTERVAL_S = 0.8
+
 
 class STTGstParakeet(STTGstBase):
     __gtype_name__ = 'STTGstParakeet'
@@ -143,11 +165,14 @@ class STTGstParakeet(STTGstBase):
             # noise ever produces stray words (it shouldn't, given the model).
             self._vad = STTVad(
                 speech_threshold=0.5,
-                # 500ms: snappier finalize. User's mid-thought pauses stay
-                # under ~0.5s, and a longer stop is usually a new sentence
-                # anyway. Parakeet decodes in ~tens of ms, so total latency
-                # after you stop is basically this window. ponytail: back to
-                # 800 if short pauses start finalizing mid-thought.
+                # 500ms: this window IS the felt latency after you stop --
+                # Parakeet decodes in ~50-300ms (RTF ~0.015 on ROCm), so nothing
+                # else in the path is worth trimming. Was 800 (a Whisper-era
+                # value, when slow decode made a longer window cheap by
+                # comparison); the X11 laptop has run 500 without chopping
+                # sentences, which is what justified matching it here.
+                # ponytail: 400 if you want it snappier still; raise back toward
+                # 800 if mid-thought pauses start splitting utterances.
                 silence_duration_ms=500,
                 speech_pad_ms=200,
                 min_speech_duration_ms=300,
@@ -162,6 +187,8 @@ class STTGstParakeet(STTGstBase):
         self._process_queue = queue.Queue()
         self._process_thread = None
         self._stop_processing = False
+        self._partial_timer_id = 0
+        self._last_partial_samples = 0
 
     def __del__(self):
         LOG_MSG.info("Parakeet __del__")
@@ -206,16 +233,54 @@ class STTGstParakeet(STTGstBase):
 
         for segment in self._vad.process(audio_float):
             LOG_MSG.debug("VAD segment ready: %.2f s", len(segment) / SAMPLE_RATE)
+            self._last_partial_samples = 0
             self._enqueue(segment)
 
         return Gst.FlowReturn.OK
 
-    def _enqueue(self, audio_float32):
-        self._process_queue.put(audio_float32)
+    def _enqueue(self, audio_float32, source='final'):
+        self._process_queue.put((source, audio_float32))
         if self._process_thread is None or not self._process_thread.is_alive():
             self._process_thread = threading.Thread(
                 target=self._process_worker, daemon=True)
             self._process_thread.start()
+
+    def _start_partial_timer(self):
+        if PARTIAL_INTERVAL_S is None or self._partial_timer_id != 0:
+            return
+        self._partial_timer_id = GLib.timeout_add(
+            int(PARTIAL_INTERVAL_S * 1000), self._on_partial_tick)
+
+    def _stop_partial_timer(self):
+        if self._partial_timer_id != 0:
+            GLib.source_remove(self._partial_timer_id)
+            self._partial_timer_id = 0
+        self._last_partial_samples = 0
+
+    def _on_partial_tick(self):
+        """Re-decode the in-progress utterance for the live preview.
+
+        Returns True to stay armed for the next tick. Skips the decode when the
+        VAD is not in speech or no new audio arrived since the last tick, so a
+        long pause costs nothing.
+        """
+        if not self._recognizing or self._vad is None or not self._vad._in_speech:
+            return True
+
+        pending = self._vad.get_pending_audio()
+        if pending is None or len(pending) == self._last_partial_samples:
+            return True
+
+        self._last_partial_samples = len(pending)
+        # Drop the tick if the worker is already busy: partials are disposable,
+        # and queueing them behind a final would show stale text after the commit.
+        if self._process_queue.qsize() == 0:
+            self._enqueue(pending, source='partial')
+        return True
+
+    def _emit_partial_text(self, text):
+        self.emit("partial-text", text)
+        return False
 
     def _ensure_model(self):
         """Lazy-load the Parakeet model on the worker thread. Returns True once
@@ -230,23 +295,27 @@ class STTGstParakeet(STTGstBase):
             self._asr_load_failed = True
             return False
         try:
-            # Prefer CUDA when an onnxruntime-gpu build exposes it; always keep
-            # CPU as fallback so a plain onnxruntime install just runs on CPU.
-            # Install onnxruntime-gpu (+ cuDNN) to light up the GPU -- no code
-            # change needed here.
+            # Prefer whichever GPU EP the installed onnxruntime build exposes --
+            # ROCM (AMD, onnxruntime-rocm wheel) or CUDA (NVIDIA, onnxruntime-gpu)
+            # -- and always keep CPU as fallback so a plain onnxruntime install
+            # just runs on CPU. No code change needed to switch GPU vendor: the
+            # launcher sets the right LD_LIBRARY_PATH (ROCm: /opt/rocm/lib +
+            # HSA_OVERRIDE_GFX_VERSION; CUDA: the nvidia-*-cuNN wheel dirs).
             import onnxruntime as _rt
             avail = _rt.get_available_providers()
-            use_cuda = USE_GPU and "CUDAExecutionProvider" in avail
-            if use_cuda and hasattr(_rt, "preload_dlls"):
-                # Load CUDA/cuDNN from the nvidia-*-cuNN pip wheels so the CUDA EP
-                # finds libcudnn.so.9 without a manual LD_LIBRARY_PATH. No-op if
-                # the wheels aren't installed -- load then falls back to CPU below.
+            gpu_ep = next((p for p in ("ROCMExecutionProvider",
+                                       "CUDAExecutionProvider")
+                           if p in avail), None) if USE_GPU else None
+            if gpu_ep == "CUDAExecutionProvider" and hasattr(_rt, "preload_dlls"):
+                # CUDA only: load cuDNN/cublas from the nvidia-*-cuNN pip wheels.
+                # ROCm libs come via LD_LIBRARY_PATH from the launcher instead.
                 try:
                     _rt.preload_dlls()
                 except Exception as e:
                     LOG_MSG.debug("onnxruntime.preload_dlls() failed: %s", e)
-            providers = (["CUDAExecutionProvider"] if use_cuda else []) \
-                        + ["CPUExecutionProvider"]
+            providers = ([gpu_ep] if gpu_ep else []) + ["CPUExecutionProvider"]
+            _gpu_label = {"ROCMExecutionProvider": "ROCm",
+                          "CUDAExecutionProvider": "CUDA"}.get(gpu_ep, "CPU")
             _qlabel = QUANTIZATION or "fp32"
             LOG_MSG.info("Loading Parakeet model: %s (providers=%s, quant=%s; "
                          "first run downloads it to the HF cache)",
@@ -254,7 +323,7 @@ class STTGstParakeet(STTGstBase):
             try:
                 self._asr = onnx_asr.load_model(
                     PARAKEET_MODEL, quantization=QUANTIZATION, providers=providers)
-                self._provider_label = f"{'CUDA' if use_cuda else 'CPU'}/{_qlabel}"
+                self._provider_label = f"{_gpu_label}/{_qlabel}"
             except Exception as gpu_err:
                 # A half-configured GPU (e.g. onnxruntime-gpu without cuDNN) can
                 # throw at session creation. Don't let that kill the backend --
@@ -278,7 +347,7 @@ class STTGstParakeet(STTGstBase):
     def _process_worker(self):
         while not self._stop_processing:
             try:
-                audio = self._process_queue.get(timeout=0.1)
+                source, audio = self._process_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
             try:
@@ -298,7 +367,14 @@ class STTGstParakeet(STTGstBase):
                 rtf = (decode_ms / 1000.0 / audio_s) if audio_s else 0.0
                 LOG_MSG.info("decode: %.2fs audio -> %.0f ms (RTF=%.3f) [%s]",
                              audio_s, decode_ms, rtf, self._provider_label)
-                if text:
+                if source == 'partial':
+                    # Preview only: never commits, never appends punctuation.
+                    # A wrong guess here is overwritten by the next tick or by
+                    # the authoritative final decode.
+                    if text:
+                        LOG_MSG.debug("Parakeet partial: '%s'", text)
+                        GLib.idle_add(self._emit_partial_text, text)
+                elif text:
                     if text[-1] not in '.?!':
                         text += '.'
                     LOG_MSG.info("Parakeet transcription result: '%s'", text)
@@ -320,6 +396,7 @@ class STTGstParakeet(STTGstBase):
         """Flush the in-progress utterance to a final result. wait=True blocks
         until the worker drains (used off the main thread); the key handler
         calls wait=False so it never stalls the IBus main loop."""
+        self._last_partial_samples = 0
         if self._vad is not None:
             remaining = self._vad.flush()
             if remaining is not None:
@@ -331,9 +408,12 @@ class STTGstParakeet(STTGstBase):
         pass
 
     def set_use_partial_results(self, active):
-        # Parakeet decodes per finalised VAD segment; there is no live partial
-        # stream. Accepted as a no-op so the engine's calls stay harmless.
-        pass
+        # Honoured only when PARTIAL_INTERVAL_S is set; otherwise Parakeet
+        # decodes per finalised VAD segment and there is no live partial stream.
+        if not active:
+            self._stop_partial_timer()
+        elif self._recognizing:
+            self._start_partial_timer()
 
     def set_alternatives_num(self, num):
         pass
@@ -348,8 +428,10 @@ class STTGstParakeet(STTGstBase):
         self._recognizing = active
         if active:
             LOG_MSG.info("recognition on")
+            self._start_partial_timer()
         else:
             LOG_MSG.info("recognition off")
+            self._stop_partial_timer()
             self.get_final_results()
             if self._vad is not None:
                 self._vad._in_speech = False
