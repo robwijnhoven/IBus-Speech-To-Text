@@ -16,539 +16,888 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-"""Parakeet speech-to-text backend.
-
-A deliberately thin sibling of the Whisper backend. It reuses the same capture
-graph (pulsesrc -> webrtcdsp -> appsink @ 16 kHz mono) and the same Silero VAD
-segmentation, then decodes each finalised VAD segment with NVIDIA Parakeet-TDT
-via onnx-asr on CPU.
-
-Parakeet is a Token-and-Duration Transducer: at every step it may emit a blank,
-so on silence/noise it produces an empty string rather than inventing text. That
-removes -- at the source -- the failure modes the Whisper backend spends ~400
-lines fighting (silence hallucination, repetition loops, streamed+tail seam
-duplication). So there is intentionally NO streaming/promotion/tail-decode,
-_collapse_repetitions, or _HALLUCINATIONS machinery here: one VAD segment in,
-one string out.
-"""
-
+import os
+import subprocess
 import logging
-import queue
-import threading
-import time
 
-import numpy as np
+from gettext import gettext as _
 
-from gi.repository import GLib
+import gi
+
+gi.require_version('IBus', '1.0')
+gi.require_version('Pango', '1.0')
+gi.require_version('Gtk', '4.0')
+
+from gi.repository import IBus
+from gi.repository import Gtk, Adw
 from gi.repository import Gio
-from gi.repository import Gst
 
-from sttgstbase import STTGstBase
-
-try:
-    import onnx_asr
-    ONNX_ASR_AVAILABLE = True
-except ImportError:
-    ONNX_ASR_AVAILABLE = False
-
-try:
-    from sttvad import STTVad
-    VAD_MODULE_OK = True
-except Exception:
-    VAD_MODULE_OK = False
-
-LOG_MSG = logging.getLogger()
-
-SAMPLE_RATE = 16000
-# Parakeet-TDT 0.6B v3: multilingual (EN + Dutch + 23 more European langs),
-# CC-BY-4.0. onnx-asr downloads it to the HF cache (~/.cache/huggingface) on
-# first load. ponytail: model id hard-coded -- there is only one, no per-locale
-# file to pick, so no model-chooser plumbing exists for this backend.
-PARAKEET_MODEL = "nemo-parakeet-tdt-0.6b-v3"
-# None = fp32 weights (~2.4GB VRAM on GPU, RTF ~0.012 on this box). "int8" = ~4x
-# smaller weights, but MEASURED ~3-5x SLOWER on the onnxruntime CUDA EP (16s audio:
-# 185ms fp32 -> 907ms int8, ~CPU speed) because the CUDA EP dequantizes instead of
-# using int8 tensor cores (those need TensorRT). So int8-on-GPU is pointless here:
-# CPU-like speed while still burning GPU VRAM. Kept fp32. ponytail: for less VRAM
-# without losing GPU speed you'd need fp16 (offline conversion); or just run on CPU
-# (same speed as int8-on-GPU, zero VRAM).
-QUANTIZATION = None
-# GPU decode works fine here (CUDA/fp32, ~100ms/utterance) -- leave it on.
-# NB: a periodic ~12s whole-desktop freeze was briefly misattributed to GPU VRAM
-# contention from this backend; the real cause was unrelated -- the V-Shell
-# (vertical-workspaces) GNOME extension saturating the compositor's main thread.
-# CPU also works (~same speed as int8-on-GPU, zero VRAM) if you ever want it.
-USE_GPU = True
-# Ignore VAD segments shorter than this -- nothing useful in a sub-200ms blip.
-MIN_SEGMENT_S = 0.2
-
-# Live preview: re-decode the in-progress utterance every N seconds and show it
-# as IBus preedit, so the silence_duration_ms wait is not dead air. The preview
-# is PREVIEW ONLY -- finalize still does the authoritative full-segment decode,
-# so committed text is byte-identical to the no-partials path. That is the whole
-# reason this is safe on a transducer: no promotion, no tail-splicing, no
-# hallucination guards to port from the Whisper backend.
-# 0.8s tick: fast enough that text visibly tracks speech, slow enough that a
-# long utterance costs a handful of decodes. NOTE each tick re-decodes the
-# WHOLE utterance so far (not just the new audio), so cost grows with utterance
-# length: measured 99ms at 4s, 376ms at 14s on ROCm. Still cheap at RTF ~0.02,
-# but it is not a constant-cost stream.
-# The final full decode is therefore often redundant -- on a 16s utterance the
-# last partial matched the final byte-for-byte and the final still cost 567ms.
-# Skipping it (cf. _maybe_promote_partial in the Whisper backend) is the next
-# real latency win; deliberately not done here to keep committed text
-# authoritative.
-# NOTE: the laptop has no measured decode timings yet -- if its RTF is much
-# worse, set this back to None there rather than letting ticks pile up.
-# ponytail: a plain constant, not a gsetting -- promote to config only if the
-# two machines need different values.
-PARTIAL_INTERVAL_S = 0.8
+from sttutils import *
+from sttgstfactory import stt_gst_factory_default
+from sttsegmentprocess import STTSegmentProcess, STTParseModes
 
 
-class STTGstParakeet(STTGstBase):
-    __gtype_name__ = 'STTGstParakeet'
+__all__ = (
+    "STTEngine"
+)
 
-    # Same capture graph as the Whisper backend; only the appsink name differs.
-    _pipeline_def = "pulsesrc name=stt_audio_src blocksize=3200 buffer-time=9223372036854775807 ! " \
-                    "audio/x-raw,format=S16LE,rate=16000,channels=1 ! " \
-                    "webrtcdsp noise-suppression-level=3 echo-cancel=false ! " \
-                    "queue ! " \
-                    "appsink name=ParakeetSink emit-signals=true sync=false"
-    _pipeline_def_alt = "pulsesrc name=stt_audio_src blocksize=3200 buffer-time=9223372036854775807 ! " \
-                        "audio/x-raw,format=S16LE,rate=16000,channels=1 ! " \
-                        "queue ! " \
-                        "appsink name=ParakeetSink emit-signals=true sync=false"
+GLib.set_prgname('ibus-engine-stt')
 
-    def __init__(self, current_locale=None):
-        plugin = Gst.Registry.get().find_plugin("webrtcdsp")
-        if plugin is not None:
-            super().__init__(pipeline_definition=STTGstParakeet._pipeline_def)
-            LOG_MSG.debug("using Webrtcdsp plugin")
+LOG_MSG=logging.getLogger()
+# LED indicators shown at the right of the status lines in the IBus widget.
+_LED_GREEN  = "🟢"
+_LED_ORANGE = "🟠"
+_LED_RED    = "🔴"
+# Mic energy detection: an RMS level above this counts as "heard something".
+_ENERGY_THRESHOLD   = 0.01
+# Mic LED stays green for this many 1 Hz ticks after the last detected energy,
+# then turns orange. 10 ticks ~= 10 seconds.
+_ENERGY_GREEN_TICKS = 10
+
+
+class STTEngine(IBus.Engine):
+    __gtype_name__ = 'STTEngine'
+
+    def __init__(self, bus, object_path):
+        if hasattr(IBus.Engine.props, 'has_focus_id'):
+            LOG_MSG.info("STTEngine has focus-in-id capabilities")
+            # FIXME: hopefully ibus 1.5.28 will have property needs_surrounding_text
+            super().__init__(connection=bus.get_connection(),
+                             object_path=object_path,
+                             has_focus_id=True)
         else:
-            super().__init__(pipeline_definition=STTGstParakeet._pipeline_def_alt)
-            LOG_MSG.debug("not using Webrtcdsp plugin")
+            LOG_MSG.info("STTEngine has NO focus-in-id capabilities")
+            super().__init__(connection=bus.get_connection(),
+                             object_path=object_path)
 
-        if self.pipeline is None:
-            LOG_MSG.error("pipeline was not created")
-            return
+        LOG_MSG.info("STTEngine created %s %i", self, self.get_property("has_focus_id"))
 
-        self._appsink = self.pipeline.get_by_name("ParakeetSink")
-        if self._appsink is None:
-            LOG_MSG.error("no appsink element!")
-            return
-        self._appsink.connect("new-sample", self._on_new_sample)
+        self._text_processor=STTSegmentProcess()
+        self._text_processor.connect("mode-changed", self._mode_changed)
+        self._text_processor.connect("need-results", self._need_results)
+        self._text_processor.connect("cancel", self._cancel)
+        self._text_processor.connect("shortcut", self._shortcut)
+        self._text_processor.connect("partial-text", self._partial_formatted_text)
+        self._text_processor.connect("final-text", self._final_formatted_text)
 
-        # Live mic level (peak-decay meter) surfaced to the IBus widget.
-        self._audio_level = 0.0
+        self._left_text=""
+        self._left_text_reset=True
+        # ponytail: committing text through IBus while a modifier (Shift/Ctrl/
+        # Alt/Super) is physically held makes GNOME/Mutter lose that modifier's
+        # release event -- the app stays "Shift down" (e.g. after Shift+Tab then
+        # talking). We defer the finalize commit until every modifier is up.
+        self._pending_commit=None
+        self._mods_held=False
+        # Last focused IBus client name, for injection diagnostics.
+        self._focus_client="?"
+        self._partials_active=None
 
-        self._settings = Gio.Settings.new("org.freedesktop.ibus.engine.stt")
-        saved_device = self._settings.get_string("audio-device")
-        if saved_device:
-            self._apply_audio_device(saved_device)
+        self._preediting=False
 
-        # The onnx-asr model is loaded lazily on the worker thread (first
-        # segment) so neither building the pipeline nor enabling the engine
-        # blocks the IBus main loop on a model load / first-run download.
-        self._asr = None
-        self._asr_load_failed = False
-        self._provider_label = "?"   # set on model load; shown in timing logs
-        # Drives the widget's model LED: 'idle' -> 'loading' -> 'ready'/'failed'.
-        # Read from the IBus main loop, written by the worker thread; a plain
-        # string assignment is atomic under the GIL, so no lock is needed.
-        self._model_state = "idle"
+        self._settings=Gio.Settings.new("org.freedesktop.ibus.engine.stt")
+        self._settings.connect("changed::stop-on-keypress", self._stop_on_key_pressed_changed)
+        self._stop_on_key_pressed=False
+        self._update_stop_on_key_pressed()
 
-        # Capture always runs (for the meter); this gates transcription so
-        # "recognition off" means "monitoring only", matching the Whisper backend.
-        self._recognizing = False
+        self._settings.connect("changed::preedit-text", self._on_preedit_text_changed)
+        self._settings.connect("changed::format-preedit", self._on_format_preedit_changed)
+        self._preedit_text=self._settings.get_boolean("preedit-text")
+        self._format_preedit=self._settings.get_boolean("format-preedit")
 
-        if VAD_MODULE_OK:
-            # Lower threshold than the Whisper backend's 0.75: Parakeet emits
-            # blank on any noise that leaks past the gate, so an aggressive gate
-            # (which risks clipping quiet speech onsets) buys nothing here. 0.5
-            # is the Silero default. ponytail: raise toward 0.6 only if idle
-            # noise ever produces stray words (it shouldn't, given the model).
-            self._vad = STTVad(
-                speech_threshold=0.5,
-                # 500ms: this window IS the felt latency after you stop --
-                # Parakeet decodes in ~50-300ms (RTF ~0.015 on ROCm), so nothing
-                # else in the path is worth trimming. Was 800 (a Whisper-era
-                # value, when slow decode made a longer window cheap by
-                # comparison); the X11 laptop has run 500 without chopping
-                # sentences, which is what justified matching it here.
-                # ponytail: 400 if you want it snappier still; raise back toward
-                # 800 if mid-thought pauses start splitting utterances.
-                silence_duration_ms=500,
-                speech_pad_ms=200,
-                min_speech_duration_ms=300,
-                max_speech_duration_s=30.0,
-                freq_thold=100.0,
-            )
-            LOG_MSG.info("VAD active: %s", self._vad.backend_name)
-        else:
-            self._vad = None
-            LOG_MSG.warning("VAD not available -- Parakeet backend requires VAD")
+        self._engine_connected=False
+        self._engine=stt_gst_factory_default().new_engine()
+        if self._engine.has_model() == False:
+            LOG_MSG.error("engine has no valid model")
 
-        self._process_queue = queue.Queue()
-        self._process_thread = None
-        self._stop_processing = False
-        self._partial_timer_id = 0
-        self._last_partial_samples = 0
+        # ~1 Hz refresh of the live status labels, only while recording.
+        self._status_timer_id=0
+        self._panel_icon = None   # last pushed panel icon; avoids needless rebuilds
+        # (prop_key, node_name, label) for each microphone radio entry.
+        self._mic_entries=[]
+        # Cache of last-pushed status labels. The 1 Hz refresh only calls
+        # update_property when a label actually changed -- otherwise the open
+        # panel menu gets rebuilt and closes under the cursor.
+        self._last_labels={}
+        # Mic energy history driving the signal LED (reset each recording start).
+        self._energy_seen_ever=False
+        self._energy_idle_ticks=0
+        # While the panel popup is open we freeze status pushes, since any
+        # update_property rebuilds the popup and closes it under the cursor.
+        self._menu_visible=False
 
-        # Warm the model now instead of on the first utterance. The load is
-        # ~8s (ONNX session + ROCm EP init); doing it lazily meant the first
-        # thing you said after a restart was swallowed by it, with a green
-        # widget and no sign anything was happening. Runs on the same worker
-        # thread that decodes, so the IBus main loop is never blocked, and
-        # _ensure_model() is idempotent -- the first real segment just finds
-        # the model already up.
-        self._start_worker()
+        self.__prop_list=IBus.PropList()
+        self.__prop_list.append(IBus.Property(key="toggle-recording",
+                                              label=_("Recognition off"),
+                                              icon="audio-input-microphone",
+                                              type=IBus.PropType.TOGGLE,
+                                              state=IBus.PropState.UNCHECKED,
+                                              tooltip=_("Toggle speech recognition")))
 
-    def _start_worker(self):
-        """Ensure the decode worker thread is alive. Safe to call repeatedly."""
-        if self._process_thread is None or not self._process_thread.is_alive():
-            self._process_thread = threading.Thread(
-                target=self._process_worker, daemon=True)
-            self._process_thread.start()
+        menu_prop_list = IBus.PropList()
+        menu_prop_list.append(IBus.Property(key="dictation-mode",
+                                            label=_("Dictate"),
+                                            type=IBus.PropType.RADIO,
+                                            state=IBus.PropState.CHECKED,
+                                            tooltip=_("Toggle dictation mode")))
+        menu_prop_list.append(IBus.Property(key="literal-mode",
+                                            label=_("Dictate (no formatting)"),
+                                            type=IBus.PropType.RADIO,
+                                            state=IBus.PropState.UNCHECKED,
+                                            tooltip=_("Toggle dictation mode with no automatic formatting")))
+        menu_prop_list.append(IBus.Property(key="spelling-mode",
+                                            label=_("Spell"),
+                                            type=IBus.PropType.RADIO,
+                                            state=IBus.PropState.UNCHECKED,
+                                            tooltip=_("Toggle spelling mode")))
+        self.__prop_list.append(IBus.Property(key="mode-menu",
+                                              label=_("Recognition mode"),
+                                              icon=None,
+                                              type=IBus.PropType.MENU,
+                                              sensitive=False,
+                                              sub_props=menu_prop_list))
+
+        self.__prop_list.append(IBus.Property(key="mic-menu",
+                                              label=_("Microphone"),
+                                              icon=None,
+                                              type=IBus.PropType.MENU,
+                                              sensitive=True,
+                                              sub_props=self._build_mic_prop_list()))
+
+        self.__prop_list.append(IBus.Property(key="digit-mode",
+                                              label=_("Use digits"),
+                                              type=IBus.PropType.TOGGLE,
+                                              state=IBus.PropState.UNCHECKED,
+                                              sensitive=False,
+                                              tooltip=_("Toggle the use of digits")))
+
+        self.__prop_list.append(IBus.Property(key="signal-status",
+                                              label=_("Microphone: off"),
+                                              type=IBus.PropType.NORMAL,
+                                              sensitive=False,
+                                              tooltip=_("Live microphone input level")))
+        self.__prop_list.append(IBus.Property(key="vad-status",
+                                              label=_("VAD: —"),
+                                              type=IBus.PropType.NORMAL,
+                                              sensitive=False,
+                                              tooltip=_("Voice activity detection status")))
+        self.__prop_list.append(IBus.Property(key="model-status",
+                                              label=_("Model: —"),
+                                              type=IBus.PropType.NORMAL,
+                                              sensitive=False,
+                                              tooltip=_("Active speech recognition model")))
+
+        self.__prop_list.append(IBus.Property(key="configuration",
+                                              label=_("Settings"),
+                                              type=IBus.PropType.NORMAL,
+                                              sensitive=True,
+                                              tooltip=_("Configure IBus STT")))
+        self.__prop_list.append(IBus.Property(key="about",
+                                              label=_("About IBus Speech To Text"),
+                                              type=IBus.PropType.NORMAL,
+                                              sensitive=True,
+                                              tooltip=_("Learn more about IBus STT")))
 
     def __del__(self):
-        LOG_MSG.info("Parakeet __del__")
-        self._stop_processing = True
-        if self._process_thread is not None:
-            self._process_thread.join(timeout=2.0)
-        super().__del__()
+        LOG_MSG.info("STTEngine destroyed %s", self)
 
-    def destroy(self):
-        self._stop_processing = True
-        if self._process_thread is not None:
-            self._process_thread.join(timeout=2.0)
-        self._appsink = None
-        self._asr = None
-        self._vad = None
-        LOG_MSG.info("Parakeet.destroy() called")
-        super().destroy()
-
-    # --- audio capture -----------------------------------------------------
-
-    def _on_new_sample(self, appsink):
-        sample = appsink.emit("pull-sample")
-        if sample is None:
-            return Gst.FlowReturn.OK
-
-        buf = sample.get_buffer()
-        success, map_info = buf.map(Gst.MapFlags.READ)
-        if not success:
-            return Gst.FlowReturn.OK
-
-        audio_data = np.frombuffer(map_info.data, dtype=np.int16)
-        buf.unmap(map_info)
-        audio_float = audio_data.astype(np.float32) / 32768.0
-
-        if len(audio_float):
-            rms = float(np.sqrt(np.mean(audio_float ** 2)))
-            # Fast attack, slow release so the meter is readable at ~1 Hz.
-            self._audio_level = rms if rms > self._audio_level else self._audio_level * 0.8
-
-        if not self._recognizing or self._vad is None:
-            return Gst.FlowReturn.OK
-
-        for segment in self._vad.process(audio_float):
-            LOG_MSG.debug("VAD segment ready: %.2f s", len(segment) / SAMPLE_RATE)
-            self._last_partial_samples = 0
-            self._enqueue(segment)
-
-        return Gst.FlowReturn.OK
-
-    def _enqueue(self, audio_float32, source='final'):
-        self._process_queue.put((source, audio_float32))
-        self._start_worker()
-
-    def _start_partial_timer(self):
-        if PARTIAL_INTERVAL_S is None or self._partial_timer_id != 0:
+    def _disconnect_from_engine(self):
+        if self._engine_connected == False:
+            LOG_MSG.debug("not connected to engine %s", self)
             return
-        self._partial_timer_id = GLib.timeout_add(
-            int(PARTIAL_INTERVAL_S * 1000), self._on_partial_tick)
 
-    def _stop_partial_timer(self):
-        if self._partial_timer_id != 0:
-            GLib.source_remove(self._partial_timer_id)
-            self._partial_timer_id = 0
-        self._last_partial_samples = 0
+        LOG_MSG.info("disconnect from engine %s", self)
+        self._engine.disconnect_by_func(self._model_changed)
+        self._engine.disconnect_by_func(self._state_changed)
+        self._engine.disconnect_by_func(self._got_text)
+        self._engine.disconnect_by_func(self._got_partial_text)
 
-    def _on_partial_tick(self):
-        """Re-decode the in-progress utterance for the live preview.
+        self._engine_connected=False
 
-        Returns True to stay armed for the next tick. Skips the decode when the
-        VAD is not in speech or no new audio arrived since the last tick, so a
-        long pause costs nothing.
+    def _connect_to_engine(self):
+        if self._engine_connected == True:
+            LOG_MSG.debug("already connected to engine %s", self)
+            return
+
+        LOG_MSG.debug("connect to engine %s", self)
+        self._engine.connect("model-changed", self._model_changed)
+        self._engine.connect("state-changed", self._state_changed)
+        self._engine.connect("text", self._got_text)
+        self._engine.connect("partial-text", self._got_partial_text)
+        self._update_partial_usage()
+        self._engine_connected=True
+
+    def do_destroy (self):
+        # This method is inherited from IBusObject
+        LOG_MSG.info("STTEngine destruction %s", self)
+
+        self._stop_status_timer()
+
+        self._settings.disconnect_by_func(self._stop_on_key_pressed_changed)
+        self._settings=None
+
+        self._text_processor.disconnect_by_func(self._mode_changed)
+        self._text_processor=None
+
+        # we need to do that since _engine might live on if preloaded
+        self._disconnect_from_engine()
+        self._engine.release()
+        self._engine = None
+
+        # This function needs CHAINING and this way or it leaks
+        IBus.Engine.do_destroy(self)
+
+    def _update_stop_on_key_pressed(self):
+        self._stop_on_key_pressed=self._settings.get_boolean("stop-on-keypress")
+
+    def _stop_on_key_pressed_changed(self, settings, key):
+        self._update_stop_on_key_pressed()
+
+    def _update_preedit_text(self):
+        self._preedit_text=self._settings.get_boolean("preedit-text")
+        self._update_partial_usage()
+
+    def _update_partial_usage(self):
+        """Stream partials (preedit) only when the user enabled them AND the
+        focused client can actually render preedit.
+
+        A client that does NOT advertise PREEDIT_TEXT makes IBus COMMIT every
+        preedit update as permanent text, so each streamed partial gets pasted in
+        full -- the "spoke once, printed 2-3x" duplication (prefix, then fuller,
+        then final, all committed). For those clients we stream nothing and commit
+        only the final result."""
+        can_preedit = bool(self.client_capabilities & IBus.Capabilite.PREEDIT_TEXT)
+        use_partials = bool(self._preedit_text and can_preedit)
+        if use_partials != self._partials_active:
+            LOG_MSG.info("partials %s (preedit-setting=%s client-preedit=%s) "
+                         "client=%s", "ON" if use_partials else "OFF",
+                         self._preedit_text, can_preedit, self._focus_client)
+            self._partials_active = use_partials
+        self._engine.set_use_partial_results(use_partials)
+
+    def _on_preedit_text_changed(self, settings, key):
+        self._update_preedit_text()
+
+    def _on_format_preedit_changed(self, settings, key):
+        self._format_preedit=self._settings.get_boolean("format-preedit")
+
+    def _is_recognizing(self):
+        # The mic keeps capturing (for the live meter) whenever the engine is
+        # enabled; "recognising" is the separate transcription state shown on
+        # the toggle. Fall back to is_running() for backends without the split.
+        if hasattr(self._engine, "is_recognizing"):
+            return self._engine.is_recognizing()
+        return self._engine.is_running()
+
+    def _set_recognizing(self, active):
+        if hasattr(self._engine, "set_recognizing"):
+            self._engine.set_recognizing(active)
+        elif active:
+            self._engine.run()
+        else:
+            self._engine.stop()
+
+    def _update_state(self):
+        if self._is_recognizing() == True:
+            button_state=IBus.PropState.CHECKED
+            button_label=IBus.Text(_("Recognition on"))
+        else:
+            button_state=IBus.PropState.UNCHECKED
+            button_label=IBus.Text(_("Recognition off"))
+
+        is_dictation = bool(self._text_processor.mode == STTParseModes.DICTATION)
+        is_spelling = bool(self._text_processor.mode == STTParseModes.SPELLING)
+        is_literal = bool(self._text_processor.mode == STTParseModes.LITERAL)
+
+        icon_name, icon_tip = self._panel_icon_for_state()
+
+        prop=IBus.Property(key="toggle-recording",
+                           label=button_label,
+                           icon=icon_name,
+                           type=IBus.PropType.TOGGLE,
+                           state=button_state,
+                           sensitive=self._engine.has_model(),
+                           tooltip=_("Toggle speech recognition") + " -- " + icon_tip)
+        self.update_property(prop)
+
+        prop = IBus.Property(key="mode-menu",
+                             label=_("Recognition modes"),
+                             icon=None,
+                             type=IBus.PropType.MENU,
+                             sensitive=(button_state == IBus.PropState.CHECKED))
+        self.update_property(prop)
+
+        prop=IBus.Property(key="dictation-mode",
+                           label=_("Dictate"),
+                           type=IBus.PropType.RADIO,
+                           state=IBus.PropState.CHECKED if is_dictation else IBus.PropState.UNCHECKED,
+                           sensitive=self._text_processor.can_dictate,
+                           tooltip=_("Toggle dictation mode"))
+        self.update_property(prop)
+
+        prop=IBus.Property(key="literal-mode",
+                           label=_("Dictate (no formatting)"),
+                           type=IBus.PropType.RADIO,
+                           state=IBus.PropState.CHECKED if is_literal else IBus.PropState.UNCHECKED,
+                           tooltip=_("Toggle dictation mode with no automatic formatting"))
+        self.update_property(prop)
+
+        prop=IBus.Property(key="spelling-mode",
+                           label=_("Spell"),
+                           type=IBus.PropType.RADIO,
+                           state=IBus.PropState.CHECKED if is_spelling else IBus.PropState.UNCHECKED,
+                           sensitive=self._text_processor.can_spell,
+                           tooltip=_("Toggle spelling mode"))
+        self.update_property(prop)
+
+        use_digits = self._text_processor.use_digits
+        prop=IBus.Property(key="digit-mode",
+                           label=_("Use digits"),
+                           type=IBus.PropType.TOGGLE,
+                           state=IBus.PropState.CHECKED if use_digits else IBus.PropState.UNCHECKED,
+                           sensitive=self._text_processor.can_use_digits,
+                           tooltip=_("Toggle the use of digits"))
+        self.update_property(prop)
+
+        if self._engine.is_running():
+            self._start_status_timer()
+        else:
+            self._stop_status_timer()
+        self._update_status_labels()
+
+    def _state_changed(self, engine):
+        # Be careful that we don't call this too often
+        self._update_state()
+
+    def _model_changed(self, engine):
+        LOG_MSG.debug("engine model has changed")
+        if self._engine.has_model() == False:
+            LOG_MSG.error("engine has no model")
+
+        self._update_state()
+
+    def _mode_changed(self, text_processor):
+        self._update_state()
+
+    def _build_mic_prop_list(self):
+        # Radio submenu: "Follow system default" plus each detected input device.
+        # Only the Whisper backend exposes device selection.
+        if hasattr(self._engine, "list_audio_sources"):
+            sources = self._engine.list_audio_sources()
+            current = self._engine.get_audio_device()
+        else:
+            sources = []
+            current = ""
+
+        self._mic_entries = []
+        prop_list = IBus.PropList()
+
+        default_label = _("Follow system default")
+        prop_list.append(IBus.Property(key="mic-default",
+                                       label=default_label,
+                                       type=IBus.PropType.RADIO,
+                                       state=IBus.PropState.UNCHECKED if current else IBus.PropState.CHECKED,
+                                       tooltip=_("Use the system default input device")))
+        self._mic_entries.append(("mic-default", "", default_label))
+
+        for node_name, desc in sources:
+            key = "mic:" + node_name
+            prop_list.append(IBus.Property(key=key,
+                                           label=desc,
+                                           type=IBus.PropType.RADIO,
+                                           state=IBus.PropState.CHECKED if current == node_name else IBus.PropState.UNCHECKED,
+                                           tooltip=_("Capture speech from this device")))
+            self._mic_entries.append((key, node_name, desc))
+
+        return prop_list
+
+    def _update_mic_state(self, current):
+        for key, node, label in self._mic_entries:
+            checked = (node == current)
+            prop = IBus.Property(key=key,
+                                 label=IBus.Text(label),
+                                 type=IBus.PropType.RADIO,
+                                 state=IBus.PropState.CHECKED if checked else IBus.PropState.UNCHECKED)
+            self.update_property(prop)
+
+    def _format_signal(self, level, running):
+        # Fixed-width output (10-cell bar + 7-char field) so the trailing LED
+        # never shifts horizontally, and so a resting mic produces a byte-stable
+        # string that the cache can suppress (keeping the menu open).
+        width = 10
+        if not running:
+            bar = "─" * width
+            field = _("off")
+        elif level < _ENERGY_THRESHOLD:
+            bar = "░" * width
+            field = _("silent")
+        else:
+            import math
+            db = 20.0 * math.log10(min(1.0, level))
+            frac = max(0.0, min(1.0, (db + 60.0) / 60.0))
+            filled = int(round(frac * width))
+            bar = "█" * filled + "░" * (width - filled)
+            field = "%4.0f dB" % db
+        return "🎤 %s %-7s" % (bar, field)
+
+    def _set_label(self, key, label):
+        # Only push when the text changed, so an idle widget keeps the menu open.
+        if self._last_labels.get(key) == label:
+            return
+        self._last_labels[key] = label
+        LOG_MSG.debug("widget push %s = %r", key, label)
+        self.update_property(IBus.Property(key=key,
+                                           label=IBus.Text(label),
+                                           type=IBus.PropType.NORMAL,
+                                           sensitive=False))
+
+    def _update_status_labels(self):
+        running = self._engine.is_running()
+
+        # Microphone LED is the only live-activity indicator: red when not
+        # recording or no signal seen yet, green while audio is flowing,
+        # orange once it has gone quiet for a while.
+        level = self._engine.get_audio_level() if hasattr(self._engine, "get_audio_level") else 0.0
+        if running:
+            if level > _ENERGY_THRESHOLD:
+                self._energy_idle_ticks = 0
+                self._energy_seen_ever = True
+            else:
+                self._energy_idle_ticks += 1
+
+        if not running or not self._energy_seen_ever:
+            mic_led = _LED_RED
+        elif self._energy_idle_ticks <= _ENERGY_GREEN_TICKS:
+            mic_led = _LED_GREEN
+        else:
+            mic_led = _LED_ORANGE
+        self._set_label("signal-status",
+                        "%s  %s" % (mic_led, self._format_signal(level, running)))
+
+        # VAD LED reflects backend availability, not whether we are recording:
+        # green = backend loaded and ready, red = unavailable. The text still
+        # shows the live speaking/idle state.
+        if hasattr(self._engine, "get_vad_status"):
+            backend, in_speech = self._engine.get_vad_status()
+        else:
+            backend, in_speech = ("", False)
+        if backend:
+            vad_led = _LED_GREEN
+            state = _("speaking") if (running and in_speech) else _("idle")
+            vad_text = "%s · %-8s" % (backend, state)
+        else:
+            vad_led = _LED_RED
+            vad_text = _("VAD: unavailable")
+        self._set_label("vad-status", "%s  %s" % (vad_led, vad_text))
+
+        # Model LED reflects whether a model is loaded/ready, independent of
+        # recording: green = model up, red = none / failed to load.
+        name = self._engine.get_model_name() if hasattr(self._engine, "get_model_name") else None
+        # Backends that load asynchronously expose get_model_status(), so the
+        # ~8s startup load shows as 'loading' instead of looking like a dead engine.
+        status = (self._engine.get_model_status()
+                  if hasattr(self._engine, "get_model_status") else None)
+        if name:
+            model_led = _LED_GREEN
+            model_text = _("Model: %s") % name
+        elif status == "loading":
+            model_led = _LED_ORANGE
+            model_text = _("Model: loading...")
+        elif status == "failed":
+            model_led = _LED_RED
+            model_text = _("Model: failed to load")
+        else:
+            model_led = _LED_RED
+            model_text = _("Model: %s") % _("none")
+        self._set_label("model-status", "%s  %s" % (model_led, model_text))
+
+    def _panel_icon_for_state(self):
+        """(icon, tooltip) for the panel button: loading / failed / on / off.
+
+        The panel icon doubles as the status light so engine state is readable
+        without opening the menu.
         """
-        if not self._recognizing or self._vad is None or not self._vad._in_speech:
-            return True
+        status = (self._engine.get_model_status()
+                  if hasattr(self._engine, "get_model_status") else None)
+        if status == "loading":
+            return ("content-loading-symbolic", _("Model: loading..."))
+        if status == "failed" or not self._engine.has_model():
+            return ("dialog-error-symbolic", _("Model: failed to load"))
+        if self._is_recognizing():
+            return ("microphone-sensitivity-high-symbolic", _("Recognition on"))
+        return ("microphone-sensitivity-muted-symbolic", _("Recognition off"))
 
-        pending = self._vad.get_pending_audio()
-        if pending is None or len(pending) == self._last_partial_samples:
-            return True
+    def _refresh_panel_icon(self):
+        """Push the panel icon only when it changed.
 
-        self._last_partial_samples = len(pending)
-        # Drop the tick if the worker is already busy: partials are disposable,
-        # and queueing them behind a final would show stale text after the commit.
-        if self._process_queue.qsize() == 0:
-            self._enqueue(pending, source='partial')
+        update_property rebuilds the popup, which closes it under the cursor,
+        so an unconditional push on every 1s tick would make the menu unusable.
+        """
+        icon_name, icon_tip = self._panel_icon_for_state()
+        if icon_name == self._panel_icon:
+            return
+        self._panel_icon = icon_name
+        self.update_property(IBus.Property(
+            key="toggle-recording",
+            label=IBus.Text(_("Recognition on") if self._is_recognizing()
+                            else _("Recognition off")),
+            icon=icon_name,
+            type=IBus.PropType.TOGGLE,
+            state=(IBus.PropState.CHECKED if self._is_recognizing()
+                   else IBus.PropState.UNCHECKED),
+            sensitive=self._engine.has_model(),
+            tooltip=_("Toggle speech recognition") + " -- " + icon_tip))
+
+    def _on_status_tick(self):
+        if not self._engine.is_running():
+            self._status_timer_id = 0
+            self._update_status_labels()
+            return False
+        # Freeze pushes while the panel popup is open, otherwise each
+        # update_property rebuilds it and closes it under the cursor.
+        if not self._menu_visible:
+            self._update_status_labels()
+            self._refresh_panel_icon()
         return True
 
-    def _emit_partial_text(self, text):
-        self.emit("partial-text", text)
-        return False
+    def do_property_show(self, prop_name):
+        LOG_MSG.debug("property show %s", prop_name)
+        self._menu_visible = True
 
-    def _ensure_model(self):
-        """Lazy-load the Parakeet model on the worker thread. Returns True once
-        the model is usable; caches a failure so we don't retry every segment."""
-        if self._asr is not None:
-            return True
-        if self._asr_load_failed:
-            return False
-        if not ONNX_ASR_AVAILABLE:
-            LOG_MSG.error("onnx_asr not available -- "
-                          "run: pip install onnx-asr huggingface_hub")
-            self._asr_load_failed = True
-            self._model_state = "failed"
-            return False
-        self._model_state = "loading"
-        try:
-            # Prefer whichever GPU EP the installed onnxruntime build exposes --
-            # ROCM (AMD, onnxruntime-rocm wheel) or CUDA (NVIDIA, onnxruntime-gpu)
-            # -- and always keep CPU as fallback so a plain onnxruntime install
-            # just runs on CPU. No code change needed to switch GPU vendor: the
-            # launcher sets the right LD_LIBRARY_PATH (ROCm: /opt/rocm/lib +
-            # HSA_OVERRIDE_GFX_VERSION; CUDA: the nvidia-*-cuNN wheel dirs).
-            import onnxruntime as _rt
-            avail = _rt.get_available_providers()
-            gpu_ep = next((p for p in ("ROCMExecutionProvider",
-                                       "CUDAExecutionProvider")
-                           if p in avail), None) if USE_GPU else None
-            if gpu_ep == "CUDAExecutionProvider" and hasattr(_rt, "preload_dlls"):
-                # CUDA only: load cuDNN/cublas from the nvidia-*-cuNN pip wheels.
-                # ROCm libs come via LD_LIBRARY_PATH from the launcher instead.
-                try:
-                    _rt.preload_dlls()
-                except Exception as e:
-                    LOG_MSG.debug("onnxruntime.preload_dlls() failed: %s", e)
-            providers = ([gpu_ep] if gpu_ep else []) + ["CPUExecutionProvider"]
-            _gpu_label = {"ROCMExecutionProvider": "ROCm",
-                          "CUDAExecutionProvider": "CUDA"}.get(gpu_ep, "CPU")
-            _qlabel = QUANTIZATION or "fp32"
-            LOG_MSG.info("Loading Parakeet model: %s (providers=%s, quant=%s; "
-                         "first run downloads it to the HF cache)",
-                         PARAKEET_MODEL, providers, _qlabel)
-            try:
-                self._asr = onnx_asr.load_model(
-                    PARAKEET_MODEL, quantization=QUANTIZATION, providers=providers)
-                self._provider_label = f"{_gpu_label}/{_qlabel}"
-            except Exception as gpu_err:
-                # A half-configured GPU (e.g. onnxruntime-gpu without cuDNN) can
-                # throw at session creation. Don't let that kill the backend --
-                # fall back to CPU, which always works.
-                if len(providers) > 1:
-                    LOG_MSG.warning("Parakeet load with %s failed (%s); "
-                                    "retrying CPU-only", providers, gpu_err)
-                    self._asr = onnx_asr.load_model(
-                        PARAKEET_MODEL, quantization=QUANTIZATION,
-                        providers=["CPUExecutionProvider"])
-                    self._provider_label = f"CPU/{_qlabel} (fallback)"
-                else:
-                    raise
-            LOG_MSG.info("Parakeet model ready (%s)", self._provider_label)
-            self._model_state = "ready"
-            return True
-        except Exception as e:
-            LOG_MSG.error("Failed to load Parakeet model: %s", e, exc_info=True)
-            self._asr_load_failed = True
-            self._model_state = "failed"
-            return False
+    def do_property_hide(self, prop_name):
+        LOG_MSG.debug("property hide %s", prop_name)
+        self._menu_visible = False
 
-    def _process_worker(self):
-        # Load up front so the wait happens at startup, not mid-sentence.
-        self._ensure_model()
-        while not self._stop_processing:
-            try:
-                source, audio = self._process_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            try:
-                if len(audio) < int(MIN_SEGMENT_S * SAMPLE_RATE):
-                    continue
-                if not self._ensure_model():
-                    continue
-                # onnx-asr accepts a float32 mono waveform at the model's 16 kHz;
-                # the VAD hands us exactly that. Transducer -> "" on silence/noise.
-                # Time the decode so CPU vs GPU is measurable: this is the compute
-                # from "VAD says you stopped" to "text ready" (total felt latency =
-                # silence_duration_ms + this). RTF = decode / audio length.
-                audio_s = len(audio) / SAMPLE_RATE
-                _t0 = time.perf_counter()
-                text = (self._asr.recognize(audio) or "").strip()
-                decode_ms = (time.perf_counter() - _t0) * 1000.0
-                rtf = (decode_ms / 1000.0 / audio_s) if audio_s else 0.0
-                LOG_MSG.info("decode: %.2fs audio -> %.0f ms (RTF=%.3f) [%s]",
-                             audio_s, decode_ms, rtf, self._provider_label)
-                if source == 'partial':
-                    # Preview only: never commits, never appends punctuation.
-                    # A wrong guess here is overwritten by the next tick or by
-                    # the authoritative final decode.
-                    if text:
-                        LOG_MSG.debug("Parakeet partial: '%s'", text)
-                        GLib.idle_add(self._emit_partial_text, text)
-                elif text:
-                    if text[-1] not in '.?!':
-                        text += '.'
-                    LOG_MSG.info("Parakeet transcription result: '%s'", text)
-                    GLib.idle_add(self._emit_text, text)
-                else:
-                    LOG_MSG.debug("Parakeet returned empty (silence/noise)")
-            except Exception as e:
-                LOG_MSG.error("Parakeet transcription error: %s", e, exc_info=True)
-            finally:
-                self._process_queue.task_done()
+    def _start_status_timer(self):
+        if self._status_timer_id == 0:
+            # Fresh recording session: restart the mic energy history.
+            self._energy_seen_ever = False
+            self._energy_idle_ticks = 0
+            self._status_timer_id = GLib.timeout_add(1000, self._on_status_tick)
 
-    def _emit_text(self, text):
-        self.emit("text", text)
-        return False
+    def _stop_status_timer(self):
+        if self._status_timer_id != 0:
+            GLib.source_remove(self._status_timer_id)
+            self._status_timer_id = 0
 
-    # --- public surface expected by sttengine.py ---------------------------
+    def do_enable(self):
+        LOG_MSG.info('enable %s', self)
 
-    def get_final_results(self, wait=True):
-        """Flush the in-progress utterance to a final result. wait=True blocks
-        until the worker drains (used off the main thread); the key handler
-        calls wait=False so it never stalls the IBus main loop."""
-        self._last_partial_samples = 0
-        if self._vad is not None:
-            remaining = self._vad.flush()
-            if remaining is not None:
-                self._enqueue(remaining)
-        if wait:
-            self._process_queue.join()
+        # Necessary to indicate we'll use surrounding text
+        # FIXME: hopefully ibus 1.5.28 will have property needs_surrounding_text
+        (ibus_text, cursor_pos, anchor_pos)=self.get_surrounding_text()
+        self._set_left_text(ibus_text, cursor_pos)
 
-    def get_results(self):
-        pass
+        # Allow for update of surrounding text by do_set_surrounding_text()
+        # though it is very unlikely it will be called at the moment.
+        self._left_text_reset=True
 
-    def set_use_partial_results(self, active):
-        # Honoured only when PARTIAL_INTERVAL_S is set; otherwise Parakeet
-        # decodes per finalised VAD segment and there is no live partial stream.
-        if not active:
-            self._stop_partial_timer()
-        elif self._recognizing:
-            self._start_partial_timer()
-
-    def set_alternatives_num(self, num):
-        pass
-
-    def is_recognizing(self):
-        return self._recognizing
-
-    def set_recognizing(self, active):
-        active = bool(active)
-        if active == self._recognizing:
+        self._connect_to_engine()
+        if self._engine.has_model() == False:
+            # There is something wrong with our model, display config dialog
+            subprocess.Popen([os.path.join(stt_utils_get_libexec(), "ibus-setup-stt")])
             return
-        self._recognizing = active
-        if active:
-            LOG_MSG.info("recognition on")
-            self._start_partial_timer()
+
+        active_on_start = self._settings.get_boolean("active-on-start")
+        LOG_MSG.info("engine enabled %s (active_on_start=%s)", self, active_on_start)
+        # Start capturing immediately so the mic meter is live; recognition
+        # (transcription) follows the active-on-start preference.
+        self._engine.run()
+        self._set_recognizing(active_on_start == True)
+        self._update_state()
+
+    def do_disable(self):
+        LOG_MSG.info('disable %s', self)
+        self._engine.stop()
+        self._disconnect_from_engine()
+
+    def do_set_capabilities(self, caps):
+        # CHAIN first so self.client_capabilities is updated by the base class,
+        # then re-decide whether this client can take streamed partials. Caps are
+        # often set right after focus-in, so this is where the preedit capability
+        # for the new client actually becomes known.
+        IBus.Engine.do_set_capabilities(self, caps)
+        self._update_partial_usage()
+
+    def do_focus_in(self):
+        LOG_MSG.debug("focus in")
+        self.do_focus_in_id("", "")
+
+    def do_focus_in_id(self, object_path, client):
+        LOG_MSG.debug("focus in id %s %s", object_path, client)
+        # Remember the focused client so injection logging can show where text
+        # was typed (helps diagnose dropped/misrouted keystrokes).
+        self._focus_client = client or object_path or "?"
+        # Safety: never stay frozen if a property-hide was missed.
+        self._menu_visible = False
+        # FIXME: hopefully ibus 1.5.28 will have property needs_surrounding_text
+        (ibus_text, cursor_pos, anchor_pos)=self.get_surrounding_text()
+        self.register_properties(self.__prop_list)
+        self._update_state()
+
+        # Shortcut depends on the client, only IBus gtk2/gtk3 clients allow it
+        if client.startswith("gtk3-im:") or client.startswith("gtk2-im:"):
+            self._text_processor.supports_shortcuts=True
         else:
-            LOG_MSG.info("recognition off")
-            self._stop_partial_timer()
-            self.get_final_results()
-            if self._vad is not None:
-                self._vad._in_speech = False
+            self._text_processor.supports_shortcuts=False
 
-    # --- status surfaced to the IBus widget --------------------------------
+        # Re-decide partials for the newly focused client (caps may already be
+        # known from a prior identical client without a fresh set_capabilities).
+        self._update_partial_usage()
 
-    def get_audio_level(self):
-        if not self.is_running():
-            return 0.0
-        return self._audio_level
+        # With recent gtk versions the "focus-in" is not always preceded by a
+        # "reset" signal. Mainly when switching to a gtk4 window with no text.
+        # Reset the left text just to make sure as it is not a time-consuming
+        # function.
+        self._reset()
 
-    def get_vad_status(self):
-        if self._vad is None:
-            return ("", False)
-        return (self._vad.backend_name,
-                bool(self._recognizing and self._vad._in_speech))
+    def do_focus_out(self):
+        LOG_MSG.debug("focus out")
+        self.do_focus_out_id("")
 
-    def get_model_name(self):
-        """Name of the *loaded* model, or None while it is not usable yet.
+    def do_focus_out_id(self, object_path):
+        LOG_MSG.debug("focus out id")
+        self._reset()
 
-        Must return None until the model is actually up: the widget's model LED
-        goes green on a non-None name, so returning the configured name
-        unconditionally showed 'ready' during the ~8s load (and after a failure).
-        """
-        return PARAKEET_MODEL if self._asr is not None else None
+    def do_reset(self):
+        LOG_MSG.debug("do reset")
+        self._reset()
 
-    def get_model_status(self):
-        """'idle' | 'loading' | 'ready' | 'failed' -- for the widget label."""
-        return self._model_state
+    def do_property_activate(self, prop_name, state):
+        # Reminder: no need to call final_results() since do_reset()
+        # do_focus_out() is called.
+        self._menu_visible = False
 
-    # --- capture device selection (mirrors the Whisper backend) ------------
+        if prop_name == 'toggle-recording':
+            # Toggle transcription only; the mic keeps capturing for the meter.
+            self._set_recognizing(bool(state) == True)
+            self._update_state()
+        elif prop_name == 'dictation-mode':
+            if state == True:
+                self._text_processor.mode = STTParseModes.DICTATION
+        elif prop_name == 'spelling-mode':
+            if state == True:
+                self._text_processor.mode = STTParseModes.SPELLING
+        elif prop_name == 'literal-mode':
+            if state == True:
+                self._text_processor.mode = STTParseModes.LITERAL
+        elif prop_name == 'digit-mode':
+            self._text_processor.use_digits = bool(state)
+        elif prop_name == 'mic-default' or prop_name.startswith('mic:'):
+            if bool(state) == True and hasattr(self._engine, 'set_audio_device'):
+                device = "" if prop_name == 'mic-default' else prop_name[len('mic:'):]
+                self._engine.set_audio_device(device)
+                self._update_mic_state(device)
+        elif prop_name == 'configuration':
+            subprocess.Popen([os.path.join(stt_utils_get_libexec(), "ibus-setup-stt")])
+        elif prop_name == 'about':
+            dialog = Adw.AboutWindow(application_name=_("IBus Speech To Text"),
+                            title=_("About IBus Speech To Text"),
+                            application_icon="user-available-symbolic",
+                            version=stt_utils_get_version(),
+                            copyright="Copyright © 2022 Philippe Rouquier",
+                            comments=_("What you say is always write."),
+                            website="https://github.com/PhilippeRo/IBus-Speech-To-Text",
+                            issue_url="https://github.com/PhilippeRo/IBus-Speech-To-Text/issues",
+                            license_type=Gtk.License.GPL_3_0,
+                            translator_credits=_("translator-credits"))
+            dialog.present()
 
-    @staticmethod
-    def list_audio_sources():
-        sources = []
-        try:
-            monitor = Gst.DeviceMonitor.new()
-            monitor.add_filter("Audio/Source", None)
-            monitor.start()
-            for dev in monitor.get_devices() or []:
-                props = dev.get_properties()
-                node_name = props.get_string("node.name") if props else None
-                if not node_name or node_name.endswith(".monitor"):
-                    continue
-                desc = dev.get_display_name() or node_name
-                sources.append((node_name, desc))
-            monitor.stop()
-        except Exception as e:
-            LOG_MSG.warning("could not enumerate audio sources: %s", e)
-        return sources
+    def _need_results(self, text_process):
+        if self._preediting == True:
+            self._engine.get_results()
 
-    def get_audio_device(self):
-        return self._settings.get_string("audio-device")
+    def _cancel(self, text_process, cancel_size):
+        # Handle potential pending cancellations
+        if (self.client_capabilities & IBus.Capabilite.SURROUNDING_TEXT) == 0:
+            LOG_MSG.debug("client application has no surrounding text capability")
 
-    def set_audio_device(self, device):
-        device = device or ""
-        self._settings.set_string("audio-device", device)
-        self._apply_audio_device(device)
+        self.delete_surrounding_text(-cancel_size, cancel_size)
 
-    def _apply_audio_device(self, device):
-        if self.pipeline is None:
-            return
-        src = self.pipeline.get_by_name("stt_audio_src")
-        if src is None:
-            LOG_MSG.warning("no audio source element to set device on")
-            return
+        # Keep our left text updated
+        text_len=len(self._left_text)
+        text_len=text_len-cancel_size if cancel_size <= text_len else text_len
+        self._left_text=self._left_text[:text_len]
 
-        ret, state, pending = self.pipeline.get_state(0)
-        if state >= Gst.State.READY:
-            self.pipeline.set_state(Gst.State.READY)
+    def _shortcut(self, text_process, keyval, modifiers):
+        if self._preediting == True:
+            # Same reason as in _final_formatted_text: end the composition
+            # explicitly. Extra bite here -- a key event forwarded while a
+            # client still thinks it is composing gets eaten by the IME.
+            self.hide_preedit_text()
+            self._preediting=False
 
-        # None tells pulsesrc to follow the system default source.
-        src.set_property("device", device if device else None)
-        LOG_MSG.info("audio capture device set to %s", device or "(system default)")
+        self.forward_key_event(keyval, 0, modifiers)
 
-        if state >= Gst.State.READY:
-            self.pipeline.set_state(state)
+    def _add_preedit_text(self, utterance):
+        # Note: we accept "" (in case we need to remove previous partial text)
+        ibus_text=IBus.Text.new_from_string(utterance)
+        # cursor_pos is the caret offset inside the preedit; keep it at the end
+        # so the caret trails the streamed text instead of sitting at its start.
+        # Counted in characters, not bytes: IBus.Text cursor_pos is a character
+        # offset, so a non-ASCII partial would otherwise overshoot.
+        self.update_preedit_text_with_mode(ibus_text,
+                                           len(utterance),
+                                           True,
+                                           IBus.PreeditFocusMode.CLEAR)
+        self._preediting=True
 
-    def _stop_real(self):
-        self.get_final_results()
-        return super()._stop_real()
+    def _partial_formatted_text(self, text_process, utterance):
+        self._add_preedit_text(utterance)
 
+    def _final_formatted_text(self, text_process, utterance):
+        if self._preediting == True:
+            # Tear the composition down with hide_preedit_text(), NOT with an
+            # empty update_preedit_text_with_mode(...CLEAR).
+            #
+            # Both end the preedit, but the empty-update form leaves Chromium
+            # holding an *active but empty* composition: the commit_text() that
+            # follows is a separate D-Bus message, so Blink re-enters composing
+            # state for the inserted run and paints it as a composition --
+            # the green/highlighted block seen in browser chat inputs
+            # (DeepSeek). The next utterance's first preedit then replaces that
+            # still-composing run, which is why continuing to speak wiped the
+            # text that had just landed. GTK and terminals drop an empty
+            # composition outright, so they never showed it.
+            #
+            # hide_preedit_text() ends composition explicitly, so the commit
+            # that follows is ordinary text insertion with no composing range.
+            self.hide_preedit_text()
+            self._preediting=False
 
-if __name__ == "__main__":
-    # Surface check: sttengine.py calls these on whatever backend is active.
-    # This fails loudly here if a rename ever drops one, instead of crashing
-    # IBus at runtime when the user switches to Parakeet. No audio/model needed.
-    required = [
-        "get_audio_device", "get_audio_level", "get_final_results",
-        "get_model_name", "get_results", "get_vad_status", "has_model",
-        "is_recognizing", "is_running", "list_audio_sources", "release",
-        "run", "set_alternatives_num", "set_audio_device", "set_recognizing",
-        "set_use_partial_results", "stop",
-    ]
-    missing = [m for m in required if not hasattr(STTGstParakeet, m)]
-    assert not missing, f"missing engine-facing methods: {missing}"
-    print("sttgstparakeet self-check: OK")
+        # Note : there could be text to write even after cancellation ("cancel
+        # write this").
+        if utterance != "":
+            paste_text = utterance.lstrip(' ')
+            if paste_text != utterance:
+                paste_text = paste_text + ' '
+            # Keep consecutive sentences from gluing together: a sentence that
+            # ends with terminal punctuation gets a trailing space so the next
+            # utterance is not glued onto it.
+            if paste_text and paste_text[-1] in '.?!':
+                paste_text = paste_text + ' '
+            # Commit through the IBus input-method protocol -- display-server
+            # agnostic (works on X11 and Wayland), no daemon/clipboard/uinput,
+            # and inserts the literal string so the keyboard layout's dead keys
+            # never apply. Preedit was already cleared above.
+            #
+            # But NOT while a modifier is physically held: an IBus commit that
+            # lands between a modifier's press and release makes GNOME/Mutter
+            # drop the release, leaving the app stuck "Shift/Ctrl/Caps down".
+            # Stash it and flush on the modifier-release in do_process_key_event.
+            if self._mods_held == True:
+                self._pending_commit=(self._pending_commit or "")+paste_text
+                LOG_MSG.debug("commit deferred (modifier held): %r", paste_text)
+            else:
+                self._commit(paste_text)
+
+    def _commit(self, paste_text):
+        self.commit_text(IBus.Text.new_from_string(paste_text))
+        self._left_text+=paste_text
+        self._left_text_reset=False
+        LOG_MSG.debug("current left text (after commit) (%s)", self._left_text)
+
+    def _got_partial_text(self, engine, utterance):
+        if self._format_preedit == True:
+            self._text_processor.utterance_process_begin(utterance, self._left_text)
+        else:
+            self._add_preedit_text(utterance)
+
+    def _got_text(self, engine, utterance):
+        self._text_processor.utterance_process_end(utterance, self._left_text)
+
+    def _reset(self):
+        # Reminder don't call final_results() or when the window is focused out,
+        # the new window will get the final result.
+        # Let the partial text be committed instead ? But in this case we need
+        # to reset the current analysis to avoid the new window to have the text
+        # In the current situation, the new window continues the voice
+        # recognition as if nothing has happened.
+
+        # Reset left text since the window might have changed
+        self._left_text=""
+        self._left_text_reset=True
+        self._text_processor.reset()
+
+        # Note: we used to do this in the hope it would force update but there
+        # is a potential problem here: select text and click -> the selected
+        # text is deleted !!
+        # if self._engine.is_running() == True:
+        #     self.commit_text(IBus.Text.new_from_string(""))
+
+    # Modifiers whose press/release we must not straddle with an IBus commit.
+    # LOCK_MASK (Caps Lock) is deliberately excluded: its bit reflects the
+    # latched on/off state, not a physical hold, so including it would keep
+    # _mods_held true for every keystroke while Caps is ON and defer commits
+    # forever. Caps release is still handled below (keyval Caps_Lock -> mods=0).
+    _MOD_MASK=(IBus.ModifierType.SHIFT_MASK
+               | IBus.ModifierType.CONTROL_MASK
+               | IBus.ModifierType.MOD1_MASK      # Alt
+               | IBus.ModifierType.SUPER_MASK)
+
+    def do_process_key_event(self, keyval, keycode, state):
+        # Track whether any modifier is physically held. IBus reports the
+        # modifier state *before* this event is applied, so on the modifier's
+        # own release the bit is still set -- clear it for that keyval.
+        is_release=(state & IBus.ModifierType.RELEASE_MASK) != 0
+        mods=state & self._MOD_MASK
+        if is_release and keyval in (
+                IBus.KEY_Shift_L, IBus.KEY_Shift_R,
+                IBus.KEY_Control_L, IBus.KEY_Control_R,
+                IBus.KEY_Alt_L, IBus.KEY_Alt_R,
+                IBus.KEY_Super_L, IBus.KEY_Super_R,
+                IBus.KEY_Caps_Lock):
+            mods=0
+        self._mods_held=(mods != 0)
+        # Modifiers just went fully up: flush any commit we held back.
+        if self._mods_held == False and self._pending_commit is not None:
+            paste_text=self._pending_commit
+            self._pending_commit=None
+            LOG_MSG.debug("flushing deferred commit: %r", paste_text)
+            self._commit(paste_text)
+
+        if is_release:
+            if self._stop_on_key_pressed == True:
+                # Stop transcribing on keypress, but keep capturing (meter live).
+                self._set_recognizing(False)
+                self._update_state()
+        else:
+            # Any keystroke should stop a potential ongoing processing.
+            # wait=False is REQUIRED here: this runs on the IBus main/UI thread,
+            # and a blocking finalize (_process_queue.join) held the main loop
+            # until decoding finished, which froze the keyboard -- keystrokes
+            # were not delivered while a decode was in flight, "fixed" only once
+            # speaking drained the queue. The final text is still emitted
+            # asynchronously by the worker.
+            if self._text_processor.is_processing() == True:
+                self._engine.get_final_results(wait=False)
+
+            # Usually there is a "set-surrounding-text" event after a key press.
+            # So get ready for the update (though we keep our current one if
+            # none comes). This is in case the key press is an arrow that moved
+            # the cursor. Instead of tracking this kind of strokes, let IBus
+            # tell us how the surrounding text changed.
+            self._left_text_reset = True
+
+        # Let the keystroke be propagated
+        return False
+
+    def _set_left_text(self, ibus_text, cursor_pos):
+        # Each text commit or preedit may reliably (but not always for example
+        # gtk3 and gtk4) sets the surrounding text. Problem is, preedit text
+        # is included.
+        # Note: at one point only bytes were used but commit in gtk change that
+        # text_bytes=ibus_text.get_text().encode()
+        # self._left_text=text_bytes[:cursor_pos].decode("utf-8")
+        self._left_text=ibus_text.get_text()[:cursor_pos]
+        LOG_MSG.debug("left text changed (%s) (original text=%s / cursor pos=%i)",
+                      self._left_text, ibus_text.get_text(), cursor_pos)
+
+        # Reminder we do not care about the context on the right, it is up to
+        # the user to add a potential missing whitespace.
+
+    def do_set_surrounding_text(self, ibus_text, cursor_pos, anchor_pos):
+        if self._left_text_reset == True:
+            self._set_left_text(ibus_text, cursor_pos)
+
+        # We need to chain this function if we want get_surrounding_text to work
+        IBus.Engine.do_set_surrounding_text(self, ibus_text, cursor_pos, anchor_pos)
