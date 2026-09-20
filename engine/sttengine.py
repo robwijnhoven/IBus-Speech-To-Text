@@ -19,6 +19,7 @@
 import os
 import subprocess
 import logging
+import unicodedata
 
 from gettext import gettext as _
 
@@ -44,6 +45,34 @@ __all__ = (
 GLib.set_prgname('ibus-engine-stt')
 
 LOG_MSG=logging.getLogger()
+
+# Dead keys, for layouts like us+intl that have them.
+#
+# IBus provides compose/dead-key handling through IBusEngineSimple, which the
+# built-in layout engines extend. An engine that does not extend it -- this one
+# -- gets none, so a dead_acute reaches the client as a raw keysym and is
+# dropped: on us+intl that makes ' " ` ~ ^ produce nothing at all, neither the
+# accented character nor the bare one, for as long as this engine is selected.
+#
+# keyval -> (combining mark, the literal the key types on its own). The literal
+# matters: dead_acute + space is the standard way to type a plain apostrophe,
+# and without it a quote is unreachable.
+_DEAD_KEYS = {
+    IBus.KEY_dead_acute:      ("\u0301", "'"),
+    IBus.KEY_dead_grave:      ("\u0300", "`"),
+    IBus.KEY_dead_diaeresis:  ("\u0308", '"'),
+    IBus.KEY_dead_tilde:      ("\u0303", "~"),
+    IBus.KEY_dead_circumflex: ("\u0302", "^"),
+    IBus.KEY_dead_cedilla:    ("\u0327", ","),
+    IBus.KEY_dead_caron:      ("\u030C", "\u02C7"),
+    IBus.KEY_dead_breve:      ("\u0306", "\u02D8"),
+    IBus.KEY_dead_macron:     ("\u0304", "\u00AF"),
+    IBus.KEY_dead_ogonek:     ("\u0328", "\u02DB"),
+    IBus.KEY_dead_abovering:  ("\u030A", "\u02DA"),
+    IBus.KEY_dead_doubleacute:("\u030B", "\u02DD"),
+    IBus.KEY_dead_abovedot:   ("\u0307", "\u02D9"),
+}
+
 
 class STTEngine(IBus.Engine):
     __gtype_name__ = 'STTEngine'
@@ -74,6 +103,7 @@ class STTEngine(IBus.Engine):
         self._left_text_reset=True
 
         self._preediting=False
+        self._pending_dead=None   # combining mark from a dead key, awaiting its base
 
         self._settings=Gio.Settings.new("org.freedesktop.ibus.engine.stt")
         self._settings.connect("changed::stop-on-keypress", self._stop_on_key_pressed_changed)
@@ -464,7 +494,65 @@ class STTEngine(IBus.Engine):
         # if self._engine.is_running() == True:
         #     self.commit_text(IBus.Text.new_from_string(""))
 
+    def _compose_dead_key(self, keyval, mods):
+        """Combine a pending dead key with this keystroke.
+
+        Returns True to swallow the key, False to let it through, or None when
+        dead keys are not involved and normal handling should continue.
+        """
+        # Never interfere with Ctrl/Alt/Super combos.
+        if mods & ~IBus.ModifierType.SHIFT_MASK:
+            self._pending_dead = None
+            return None
+
+        entry = _DEAD_KEYS.get(keyval)
+        if entry is not None:
+            if self._pending_dead is not None:
+                # Same dead key twice types the bare mark, and two different
+                # ones cannot combine: emit the pending literal, keep this one.
+                prev_literal = self._pending_dead[1]
+                self._pending_dead = entry
+                self.commit_text(IBus.Text.new_from_string(prev_literal))
+                return True
+            self._pending_dead = entry
+            return True      # swallow: nothing shows until the base arrives
+
+        if self._pending_dead is None:
+            return None      # ordinary key, nothing pending
+
+        combining, literal = self._pending_dead
+        self._pending_dead = None
+
+        base = IBus.keyval_to_unicode(keyval)
+        if not base:
+            # Arrow, Escape, Backspace...: the accent is abandoned, but emit
+            # its literal so the keystroke is not silently lost.
+            self.commit_text(IBus.Text.new_from_string(literal))
+            return None
+
+        if base == " ":
+            # The canonical "I meant the plain character" escape.
+            self.commit_text(IBus.Text.new_from_string(literal))
+            return True
+
+        composed = unicodedata.normalize("NFC", base + combining)
+        if len(composed) != 1:
+            # No precomposed form (dead_acute + q): type both, as a real dead
+            # key does, rather than dropping the accent silently.
+            composed = literal + base
+
+        self.commit_text(IBus.Text.new_from_string(composed))
+        return True
+
     def do_process_key_event(self, keyval, keycode, state):
+        # Dead-key compose must run first: without it the keysym is forwarded
+        # raw and the client drops it, so ' + e yields nothing.
+        if (state & IBus.ModifierType.RELEASE_MASK) == 0:
+            handled = self._compose_dead_key(
+                keyval, state & ~IBus.ModifierType.RELEASE_MASK)
+            if handled is not None:
+                return handled
+
         if (state & IBus.ModifierType.RELEASE_MASK) != 0:
             if self._stop_on_key_pressed == True:
                 self._engine.stop()
