@@ -152,6 +152,10 @@ class STTGstParakeet(STTGstBase):
         self._asr = None
         self._asr_load_failed = False
         self._provider_label = "?"   # set on model load; shown in timing logs
+        # Drives the widget's model LED: 'idle' -> 'loading' -> 'ready'/'failed'.
+        # Read from the IBus main loop, written by the worker thread; a plain
+        # string assignment is atomic under the GIL, so no lock is needed.
+        self._model_state = "idle"
 
         # Capture always runs (for the meter); this gates transcription so
         # "recognition off" means "monitoring only", matching the Whisper backend.
@@ -189,6 +193,22 @@ class STTGstParakeet(STTGstBase):
         self._stop_processing = False
         self._partial_timer_id = 0
         self._last_partial_samples = 0
+
+        # Warm the model now instead of on the first utterance. The load is
+        # ~8s (ONNX session + ROCm EP init); doing it lazily meant the first
+        # thing you said after a restart was swallowed by it, with a green
+        # widget and no sign anything was happening. Runs on the same worker
+        # thread that decodes, so the IBus main loop is never blocked, and
+        # _ensure_model() is idempotent -- the first real segment just finds
+        # the model already up.
+        self._start_worker()
+
+    def _start_worker(self):
+        """Ensure the decode worker thread is alive. Safe to call repeatedly."""
+        if self._process_thread is None or not self._process_thread.is_alive():
+            self._process_thread = threading.Thread(
+                target=self._process_worker, daemon=True)
+            self._process_thread.start()
 
     def __del__(self):
         LOG_MSG.info("Parakeet __del__")
@@ -240,10 +260,7 @@ class STTGstParakeet(STTGstBase):
 
     def _enqueue(self, audio_float32, source='final'):
         self._process_queue.put((source, audio_float32))
-        if self._process_thread is None or not self._process_thread.is_alive():
-            self._process_thread = threading.Thread(
-                target=self._process_worker, daemon=True)
-            self._process_thread.start()
+        self._start_worker()
 
     def _start_partial_timer(self):
         if PARTIAL_INTERVAL_S is None or self._partial_timer_id != 0:
@@ -293,7 +310,9 @@ class STTGstParakeet(STTGstBase):
             LOG_MSG.error("onnx_asr not available -- "
                           "run: pip install onnx-asr huggingface_hub")
             self._asr_load_failed = True
+            self._model_state = "failed"
             return False
+        self._model_state = "loading"
         try:
             # Prefer whichever GPU EP the installed onnxruntime build exposes --
             # ROCM (AMD, onnxruntime-rocm wheel) or CUDA (NVIDIA, onnxruntime-gpu)
@@ -338,13 +357,17 @@ class STTGstParakeet(STTGstBase):
                 else:
                     raise
             LOG_MSG.info("Parakeet model ready (%s)", self._provider_label)
+            self._model_state = "ready"
             return True
         except Exception as e:
             LOG_MSG.error("Failed to load Parakeet model: %s", e, exc_info=True)
             self._asr_load_failed = True
+            self._model_state = "failed"
             return False
 
     def _process_worker(self):
+        # Load up front so the wait happens at startup, not mid-sentence.
+        self._ensure_model()
         while not self._stop_processing:
             try:
                 source, audio = self._process_queue.get(timeout=0.1)
@@ -450,7 +473,17 @@ class STTGstParakeet(STTGstBase):
                 bool(self._recognizing and self._vad._in_speech))
 
     def get_model_name(self):
-        return PARAKEET_MODEL
+        """Name of the *loaded* model, or None while it is not usable yet.
+
+        Must return None until the model is actually up: the widget's model LED
+        goes green on a non-None name, so returning the configured name
+        unconditionally showed 'ready' during the ~8s load (and after a failure).
+        """
+        return PARAKEET_MODEL if self._asr is not None else None
+
+    def get_model_status(self):
+        """'idle' | 'loading' | 'ready' | 'failed' -- for the widget label."""
+        return self._model_state
 
     # --- capture device selection (mirrors the Whisper backend) ------------
 
