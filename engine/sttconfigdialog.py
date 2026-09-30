@@ -57,6 +57,7 @@ class STTConfigDialog (Adw.Window):
     vosk_check     = Gtk.Template.Child()
     whisper_check  = Gtk.Template.Child()
     parakeet_check = Gtk.Template.Child()
+    ultra_check = Gtk.Template.Child()
 
     tab_stack    = Gtk.Template.Child()
     tab_switcher = Gtk.Template.Child()
@@ -119,6 +120,8 @@ class STTConfigDialog (Adw.Window):
             self.whisper_check.set_active(True)
         elif backend == "parakeet":
             self.parakeet_check.set_active(True)
+        elif backend == "ultra":
+            self.ultra_check.set_active(True)
         else:
             self.vosk_check.set_active(True)
         self._suppress_engine_cb = False
@@ -148,7 +151,7 @@ class STTConfigDialog (Adw.Window):
 
         # Parakeet manages its own model (auto-download), so never show the
         # "no model / download" prompt for it; still check the formatting file.
-        if (self._settings.get_string("backend") != "parakeet"
+        if (self._settings.get_string("backend") not in ("parakeet", "ultra")
                 and (self._model is None or not self._model.available())):
             self._engine_has_no_model()
         elif self._valid_formatting_file == False:
@@ -177,7 +180,10 @@ class STTConfigDialog (Adw.Window):
         if backend == "whisper":
             self._engine = STTGstWhisper(current_locale=self._current_locale)
         elif backend == "parakeet":
-            self._engine = STTGstParakeet(current_locale=self._current_locale)
+            self._engine = STTGstParakeet(current_locale=self._current_locale, warm=False)
+        elif backend == "ultra":
+            from sttgstultra import STTGstUltra
+            self._engine = STTGstUltra(current_locale=self._current_locale, warm=False)
         else:
             self._engine = STTGstVosk(current_locale=self._current_locale)
 
@@ -246,7 +252,7 @@ class STTConfigDialog (Adw.Window):
         # Parakeet has no per-locale model file to pick or download -- onnx-asr
         # fetches the one multilingual model automatically. So there is no model
         # object, and the download/change UI is hidden in _update_model_info.
-        if backend == "parakeet":
+        if backend in ("parakeet", "ultra"):
             self._model = None
             self._update_model_info()
             return
@@ -260,9 +266,11 @@ class STTConfigDialog (Adw.Window):
         self._update_model_info()
 
     def _update_model_info(self):
-        if self._settings.get_string("backend") == "parakeet":
+        if self._settings.get_string("backend") in ("parakeet", "ultra"):
             # No model selection for Parakeet -- hide the download/change button.
-            self.model_info_row.set_title(_("Parakeet (multilingual)"))
+            self.model_info_row.set_title(_("Parakeet Ultra (multilingual)")
+                                          if self._settings.get_string("backend") == "ultra"
+                                          else _("Parakeet (multilingual)"))
             self.model_info_row.set_subtitle(
                 _("Downloaded automatically · no model selection needed"))
             self.change_model_button.set_visible(False)
@@ -357,6 +365,8 @@ class STTConfigDialog (Adw.Window):
             backend = "vosk"
         elif button == self.parakeet_check:
             backend = "parakeet"
+        elif button == self.ultra_check:
+            backend = "ultra"
         else:
             backend = "whisper"
         current = self._settings.get_string("backend")

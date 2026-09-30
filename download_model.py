@@ -61,6 +61,15 @@ def download_parakeet():
     print("Parakeet model ready.")
 
 
+def download_ultra():
+    from huggingface_hub import snapshot_download
+    print("Downloading moondream/parakeet-ultra (~1.26 GB) to the HF cache ...")
+    # Weights only, straight from HF -- Photon itself is never started here,
+    # so no telemetry path is involved.
+    path = snapshot_download("moondream/parakeet-ultra")
+    print(f"Parakeet Ultra at {path}")
+
+
 def download_whisper(filename, models_dir):
     try:
         from huggingface_hub import hf_hub_download
@@ -78,6 +87,8 @@ def main():
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument("--parakeet", action="store_true",
                        help="Download the Parakeet (onnx-asr) model")
+    group.add_argument("--ultra", action="store_true",
+                       help="Download Parakeet Ultra (Photon backend)")
     group.add_argument("--whisper", action="store_true",
                        help="Download a whisper.cpp ggml model")
     ap.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL,
@@ -89,6 +100,8 @@ def main():
 
     if args.parakeet:
         download_parakeet()
+    elif args.ultra:
+        download_ultra()
     else:
         download_whisper(args.whisper_model, args.models_dir)
 

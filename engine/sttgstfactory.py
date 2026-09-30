@@ -52,6 +52,11 @@ class STTGstFactory(GObject.GObject):
             if backend == "whisper":
                 LOG_MSG.info("Using Whisper backend")
                 engine=STTGstWhisper()
+            elif backend == "ultra":
+                LOG_MSG.info("Using Parakeet Ultra backend")
+                # Lazy: pulls in torch, which the other backends don't need.
+                from sttgstultra import STTGstUltra
+                engine=STTGstUltra()
             elif backend == "parakeet":
                 LOG_MSG.info("Using Parakeet backend")
                 engine=STTGstParakeet()
