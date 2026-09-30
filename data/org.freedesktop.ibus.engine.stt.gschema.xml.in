@@ -43,8 +43,8 @@
     </key>
     <key type="s" name="backend">
       <summary>Speech recognition backend</summary>
-      <default>'vosk'</default>
-      <description>Choose the speech recognition backend: 'vosk' or 'whisper'</description>
+      <default>'ultra'</default>
+      <description>Choose the speech recognition backend: 'ultra' (Parakeet Ultra, GPU, default), 'parakeet', 'whisper' or 'vosk'</description>
     </key>
     <key type="s" name="whisper-models">
       <summary>Paths to Whisper models</summary>
