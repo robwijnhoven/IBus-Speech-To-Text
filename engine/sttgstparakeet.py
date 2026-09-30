@@ -15,6 +15,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
+from sttutils import stt_utils_log_text
 
 """Parakeet speech-to-text backend.
 
@@ -404,7 +405,7 @@ class STTGstParakeet(STTGstBase):
                     # A wrong guess here is overwritten by the next tick or by
                     # the authoritative final decode.
                     if text:
-                        LOG_MSG.debug("Parakeet partial: '%s'", text)
+                        LOG_MSG.debug("Parakeet partial: %s", stt_utils_log_text(text))
                         self._last_partial_text = text
                         GLib.idle_add(self._emit_partial_text, text)
                     continue
@@ -416,7 +417,7 @@ class STTGstParakeet(STTGstBase):
                 if text:
                     if text[-1] not in '.?!':
                         text += '.'
-                    LOG_MSG.info("Parakeet transcription result: '%s'", text)
+                    LOG_MSG.info("Parakeet transcription result: %s", stt_utils_log_text(text))
                     GLib.idle_add(self._emit_text, text)
                 else:
                     LOG_MSG.debug("Parakeet returned empty (silence/noise)")

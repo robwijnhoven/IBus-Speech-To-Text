@@ -811,7 +811,7 @@ class STTEngine(IBus.Engine):
             # Stash it and flush on the modifier-release in do_process_key_event.
             if self._mods_held == True:
                 self._pending_commit=(self._pending_commit or "")+paste_text
-                LOG_MSG.debug("commit deferred (modifier held): %r", paste_text)
+                LOG_MSG.debug("commit deferred (modifier held): %s", stt_utils_log_text(paste_text))
             else:
                 self._commit(paste_text)
 
@@ -819,7 +819,7 @@ class STTEngine(IBus.Engine):
         self.commit_text(IBus.Text.new_from_string(paste_text))
         self._left_text+=paste_text
         self._left_text_reset=False
-        LOG_MSG.debug("current left text (after commit) (%s)", self._left_text)
+        LOG_MSG.debug("left text after commit: %s", stt_utils_log_text(self._left_text))
 
     def _got_partial_text(self, engine, utterance):
         if self._format_preedit == True:
@@ -949,7 +949,7 @@ class STTEngine(IBus.Engine):
         if self._mods_held == False and self._pending_commit is not None:
             paste_text=self._pending_commit
             self._pending_commit=None
-            LOG_MSG.debug("flushing deferred commit: %r", paste_text)
+            LOG_MSG.debug("flushing deferred commit: %s", stt_utils_log_text(paste_text))
             self._commit(paste_text)
 
         if is_release:
@@ -986,8 +986,8 @@ class STTEngine(IBus.Engine):
         # text_bytes=ibus_text.get_text().encode()
         # self._left_text=text_bytes[:cursor_pos].decode("utf-8")
         self._left_text=ibus_text.get_text()[:cursor_pos]
-        LOG_MSG.debug("left text changed (%s) (original text=%s / cursor pos=%i)",
-                      self._left_text, ibus_text.get_text(), cursor_pos)
+        LOG_MSG.debug("left text changed (%s, cursor pos=%i)",
+                      stt_utils_log_text(self._left_text), cursor_pos)
 
         # Reminder we do not care about the context on the right, it is up to
         # the user to add a potential missing whitespace.

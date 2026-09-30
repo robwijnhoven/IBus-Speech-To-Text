@@ -154,7 +154,7 @@ class STTGstVosk(STTGstBase):
             LOG_MSG.debug("empty json answer")
             return
 
-        LOG_MSG.debug("JSON string %s", json_text)
+        LOG_MSG.debug("JSON result: %s", stt_utils_log_text(json_text))
         try:
             # Catch ill-formatted files
             json_data = json.loads(json_text)

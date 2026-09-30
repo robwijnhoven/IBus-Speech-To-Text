@@ -44,3 +44,12 @@ def stt_utils_get_libexec():
 
 def stt_utils_ibus_component_description_path():
     return os.path.join("/usr/share/ibus/component", "stt.xml")
+
+# Privacy: dictated/typed text never reaches the log in normal operation.
+# Run with STT_LOG_TEXT=1 to see it while debugging.
+_LOG_TEXT = os.environ.get("STT_LOG_TEXT") == "1"
+
+def stt_utils_log_text(text):
+    if _LOG_TEXT:
+        return repr(text)
+    return "<%d chars>" % len(text or "")

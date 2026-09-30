@@ -626,7 +626,7 @@ class STTGstWhisper(STTGstBase):
                     partial_text, partial_samples, len(audio))
                 if promoted is not None:
                     LOG_MSG.info("Promoted last partial as final (skipped "
-                                 "re-decode): '%s'", promoted)
+                                 "re-decode): %s", stt_utils_log_text(promoted))
                     text = promoted
                     if text[-1] not in '.?!':
                         text += '.'
@@ -666,7 +666,7 @@ class STTGstWhisper(STTGstBase):
                     # that, on its own, is nothing but a known filler phrase.
                     tail_text = ' '.join(tail_words).strip()
                     if tail_text and tail_text.lower() in _HALLUCINATIONS:
-                        LOG_MSG.info("Dropped hallucinated tail: '%s'", tail_text)
+                        LOG_MSG.info("Dropped hallucinated tail: %s", stt_utils_log_text(tail_text))
                         tail_words = []
                     # Drop leading tail words that just re-hear the end of the
                     # streamed text (the seam-duplication bug); _collapse_repetitions
@@ -676,7 +676,7 @@ class STTGstWhisper(STTGstBase):
                     if text and text.lower() not in _HALLUCINATIONS:
                         if text[-1] not in '.?!':
                             text += '.'
-                        LOG_MSG.info("Final (streamed + tail): '%s'", text)
+                        LOG_MSG.info("Final (streamed + tail): %s", stt_utils_log_text(text))
                         GLib.idle_add(self._emit_text, text)
                     self._process_queue.task_done()
                     continue
@@ -707,15 +707,15 @@ class STTGstWhisper(STTGstBase):
 
                     prob = getattr(segment, 'probability', float('nan'))
                     if prob == prob and prob < MIN_SEGMENT_PROB:
-                        LOG_MSG.debug("Low confidence segment (%.3f): '%s'",
-                                      prob, segment_text)
+                        LOG_MSG.debug("Low confidence segment (%.3f): %s",
+                                      prob, stt_utils_log_text(segment_text))
                         low_confidence = True
                         continue
 
                     if segment_text:
                         text_parts.append(segment_text)
-                        LOG_MSG.debug("Segment text: '%s' (prob=%.3f)",
-                                      segment_text, prob)
+                        LOG_MSG.debug("Segment: %s (prob=%.3f)",
+                                      stt_utils_log_text(segment_text), prob)
 
                 text = ' '.join(text_parts).strip()
                 text = _collapse_repetitions(text)
@@ -723,15 +723,15 @@ class STTGstWhisper(STTGstBase):
                 if text and text.lower() not in _HALLUCINATIONS:
                     deduped = _collapse_repetitions(text)
                     if deduped != text:
-                        LOG_MSG.info("Collapsed repetition: '%s' -> '%s'",
-                                     text, deduped)
+                        LOG_MSG.info("Collapsed repetition: %s -> %s",
+                                     stt_utils_log_text(text), stt_utils_log_text(deduped))
                         text = deduped
                     if text and text[-1] not in '.?!':
                         text += '.'
-                    LOG_MSG.info("Whisper transcription result: '%s'", text)
+                    LOG_MSG.info("Whisper transcription result: %s", stt_utils_log_text(text))
                     GLib.idle_add(self._emit_text, text)
                 elif text:
-                    LOG_MSG.debug("Filtered hallucination: '%s'", text)
+                    LOG_MSG.debug("Filtered hallucination: %s", stt_utils_log_text(text))
                 elif low_confidence:
                     LOG_MSG.info("Discarded low-confidence audio segment")
                 else:
@@ -808,7 +808,7 @@ class STTGstWhisper(STTGstBase):
                 self._last_partial_text_samples = total_samples
 
         if preview and preview.lower() not in _HALLUCINATIONS:
-            LOG_MSG.debug("Partial (agreed=%dw): '%s'", len(agreed), preview)
+            LOG_MSG.debug("Partial (agreed=%dw): %s", len(agreed), stt_utils_log_text(preview))
             GLib.idle_add(self._emit_partial_text, preview)
 
     def _start_partial_timer(self):
