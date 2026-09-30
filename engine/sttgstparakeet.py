@@ -119,7 +119,7 @@ class STTGstParakeet(STTGstBase):
                         "queue ! " \
                         "appsink name=ParakeetSink emit-signals=true sync=false"
 
-    def __init__(self, current_locale=None):
+    def __init__(self, current_locale=None, warm=True):
         plugin = Gst.Registry.get().find_plugin("webrtcdsp")
         if plugin is not None:
             super().__init__(pipeline_definition=STTGstParakeet._pipeline_def)
@@ -193,6 +193,12 @@ class STTGstParakeet(STTGstBase):
         self._stop_processing = False
         self._partial_timer_id = 0
         self._last_partial_samples = 0
+        # Last preview text shown as preedit. If the final decode yields nothing
+        # we commit this instead: an uncommitted preedit is otherwise stranded
+        # on screen and wiped by the next utterance's first partial.
+        self._last_partial_text = ""
+        # CPU session, loaded only after a GPU decode fails (see _decode).
+        self._asr_cpu = None
 
         # Warm the model now instead of on the first utterance. The load is
         # ~8s (ONNX session + ROCm EP init); doing it lazily meant the first
@@ -201,7 +207,10 @@ class STTGstParakeet(STTGstBase):
         # thread that decodes, so the IBus main loop is never blocked, and
         # _ensure_model() is idempotent -- the first real segment just finds
         # the model already up.
-        self._start_worker()
+        # warm=False: the Preferences dialog's throwaway engine -- don't put a
+        # second model copy on the 4GB GPU just because the dialog opened.
+        if warm:
+            self._start_worker()
 
     def _start_worker(self):
         """Ensure the decode worker thread is alive. Safe to call repeatedly."""
@@ -385,7 +394,7 @@ class STTGstParakeet(STTGstBase):
                 # silence_duration_ms + this). RTF = decode / audio length.
                 audio_s = len(audio) / SAMPLE_RATE
                 _t0 = time.perf_counter()
-                text = (self._asr.recognize(audio) or "").strip()
+                text = self._decode(audio, source)
                 decode_ms = (time.perf_counter() - _t0) * 1000.0
                 rtf = (decode_ms / 1000.0 / audio_s) if audio_s else 0.0
                 LOG_MSG.info("decode: %.2fs audio -> %.0f ms (RTF=%.3f) [%s]",
@@ -396,8 +405,15 @@ class STTGstParakeet(STTGstBase):
                     # the authoritative final decode.
                     if text:
                         LOG_MSG.debug("Parakeet partial: '%s'", text)
+                        self._last_partial_text = text
                         GLib.idle_add(self._emit_partial_text, text)
-                elif text:
+                    continue
+                if not text and self._last_partial_text:
+                    LOG_MSG.warning("final empty/failed -- committing last "
+                                    "partial so the preedit is not lost")
+                    text = self._last_partial_text
+                self._last_partial_text = ""
+                if text:
                     if text[-1] not in '.?!':
                         text += '.'
                     LOG_MSG.info("Parakeet transcription result: '%s'", text)
@@ -408,6 +424,33 @@ class STTGstParakeet(STTGstBase):
                 LOG_MSG.error("Parakeet transcription error: %s", e, exc_info=True)
             finally:
                 self._process_queue.task_done()
+
+    def _decode(self, audio, source):
+        """Decode on the loaded session; on failure retry finals on CPU.
+
+        The laptop GPU has 4GB and the fp32 model sits at ~3.56GB steady state, so
+        arena fragmentation (every partial is a new input length) or any other
+        VRAM user eventually OOMs a decode. Without this the final was dropped
+        and the preedit stranded. Partials just fail -- they're disposable.
+        ponytail: CPU fallback is ~11x realtime (20s audio ~2s); if OOMs get
+        frequent, set USE_GPU=False or reload the GPU session to reset its arena.
+        """
+        try:
+            return (self._asr.recognize(audio) or "").strip()
+        except Exception as e:
+            if source == 'partial':
+                raise
+            LOG_MSG.warning("GPU decode failed (%s); retrying on CPU", e)
+            try:
+                if self._asr_cpu is None:
+                    self._asr_cpu = onnx_asr.load_model(
+                        PARAKEET_MODEL, quantization=QUANTIZATION,
+                        providers=["CPUExecutionProvider"])
+                return (self._asr_cpu.recognize(audio) or "").strip()
+            except Exception as e2:
+                # "" lets the worker fall back to the last partial.
+                LOG_MSG.error("CPU decode failed too: %s", e2, exc_info=True)
+                return ""
 
     def _emit_text(self, text):
         self.emit("text", text)
@@ -551,4 +594,19 @@ if __name__ == "__main__":
     ]
     missing = [m for m in required if not hasattr(STTGstParakeet, m)]
     assert not missing, f"missing engine-facing methods: {missing}"
+
+    # OOM path: GPU raises on the final -> CPU session answers; partials re-raise.
+    class _Boom:
+        def recognize(self, a): raise RuntimeError("Failed to allocate memory")
+    class _Ok:
+        def recognize(self, a): return " hello "
+    from types import SimpleNamespace
+    dec = STTGstParakeet._decode
+    assert dec(SimpleNamespace(_asr=_Boom(), _asr_cpu=_Ok()), None, 'final') == "hello"
+    assert dec(SimpleNamespace(_asr=_Boom(), _asr_cpu=_Boom()), None, 'final') == ""
+    try:
+        dec(SimpleNamespace(_asr=_Boom(), _asr_cpu=_Ok()), None, 'partial')
+        raise AssertionError("partial must raise")
+    except RuntimeError:
+        pass
     print("sttgstparakeet self-check: OK")
