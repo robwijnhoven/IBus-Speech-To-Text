@@ -453,24 +453,15 @@ class STTEngine(IBus.Engine):
             self.update_property(prop)
 
     def _format_signal(self, level, running):
-        # Fixed-width output (10-cell bar + 7-char field) so the trailing LED
-        # never shifts horizontally, and so a resting mic produces a byte-stable
-        # string that the cache can suppress (keeping the menu open).
-        width = 10
-        if not running:
-            bar = "─" * width
-            field = _("off")
-        elif level < _ENERGY_THRESHOLD:
-            bar = "░" * width
-            field = _("silent")
-        else:
-            import math
-            db = 20.0 * math.log10(min(1.0, level))
-            frac = max(0.0, min(1.0, (db + 60.0) / 60.0))
-            filled = int(round(frac * width))
-            bar = "█" * filled + "░" * (width - filled)
-            field = "%4.0f dB" % db
-        return "🎤 %s %-7s" % (bar, field)
+        # Coarse state only -- NO live dB bar. Every update_property makes GNOME
+        # Shell (46, status/keyboard.js _buildPropSection) destroy and rebuild
+        # the whole IBus menu; pushing a changing meter every second made it do
+        # that 60x/min, and the garbage it left behind forced a SpiderMonkey GC
+        # stall of ~0.5-1s on the compositor thread every ~11s (perf-proven
+        # 2026-09-30: 94% libgjs/mozjs during each spike). The meter was never
+        # visible live anyway: pushes are frozen while the menu is open.
+        # The LED (green = audio flowing, orange = quiet a while) carries it.
+        return "🎤 %s" % (_("on") if running else _("off"))
 
     def _set_label(self, key, label):
         # Only push when the text changed, so an idle widget keeps the menu open.
@@ -515,8 +506,9 @@ class STTEngine(IBus.Engine):
             backend, in_speech = ("", False)
         if backend:
             vad_led = _LED_GREEN
-            state = _("speaking") if (running and in_speech) else _("idle")
-            vad_text = "%s · %-8s" % (backend, state)
+            # No speaking/idle here: it flips every utterance and each flip is
+            # a full shell menu rebuild (see _format_signal).
+            vad_text = backend
         else:
             vad_led = _LED_RED
             vad_text = _("VAD: unavailable")
