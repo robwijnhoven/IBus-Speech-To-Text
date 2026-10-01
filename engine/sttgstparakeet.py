@@ -140,12 +140,14 @@ class STTGstParakeet(STTGstBase):
     __gtype_name__ = 'STTGstParakeet'
 
     # Same capture graph as the Whisper backend; only the appsink name differs.
-    _pipeline_def = "pulsesrc name=stt_audio_src blocksize=3200 buffer-time=9223372036854775807 ! " \
+    # blocksize=1024 bytes = 512 S16 samples = 32ms = one Silero chunk, so the
+    # silence window closes on time instead of on a 100ms (3200) block boundary.
+    _pipeline_def = "pulsesrc name=stt_audio_src blocksize=1024 buffer-time=9223372036854775807 ! " \
                     "audio/x-raw,format=S16LE,rate=16000,channels=1 ! " \
                     "webrtcdsp noise-suppression-level=3 echo-cancel=false ! " \
                     "queue ! " \
                     "appsink name=ParakeetSink emit-signals=true sync=false"
-    _pipeline_def_alt = "pulsesrc name=stt_audio_src blocksize=3200 buffer-time=9223372036854775807 ! " \
+    _pipeline_def_alt = "pulsesrc name=stt_audio_src blocksize=1024 buffer-time=9223372036854775807 ! " \
                         "audio/x-raw,format=S16LE,rate=16000,channels=1 ! " \
                         "queue ! " \
                         "appsink name=ParakeetSink emit-signals=true sync=false"
@@ -206,9 +208,12 @@ class STTGstParakeet(STTGstBase):
                 # value, when slow decode made a longer window cheap by
                 # comparison); the X11 laptop has run 500 without chopping
                 # sentences, which is what justified matching it here.
-                # ponytail: 400 if you want it snappier still; raise back toward
-                # 800 if mid-thought pauses start splitting utterances.
-                silence_duration_ms=500,
+                # 2026-10-01: 500 -> 300 at the user's request (as low as possible).
+                # Cost: a mid-thought pause now ends the segment, and Parakeet
+                # punctuates each segment, so expect more stray '.'/capitals.
+                # ponytail: 400 if that bites; below 300 chopped sentences even
+                # in the Whisper era.
+                silence_duration_ms=300,
                 speech_pad_ms=200,
                 min_speech_duration_ms=300,
                 max_speech_duration_s=30.0,
