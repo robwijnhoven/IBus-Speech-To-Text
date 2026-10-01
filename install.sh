@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 #
 # ibus-stt one-shot setup: pick a backend + CPU/GPU, install the matching Python
-# deps (incl. CUDA wheels for GPU), download the model, and select the backend.
+# deps (incl. CUDA wheels for GPU), download the model, select the backend, and
+# write the launcher (/usr/libexec/ibus-engine-stt -> this venv) + the log.
 #
 # Run it from anywhere:  ./install.sh   (or:  bash install.sh)
 #
-# venv + models default to inside this repo dir; override via env:
-#   VENV=/opt/ibus-stt/venv MODELS_DIR=/opt/ibus-stt/models ./install.sh
+# venv + models default to /opt/ibus-stt, outside the home dir, so moving or
+# renaming the project can't break a running engine; override via env:
+#   VENV=~/stt-venv MODELS_DIR=~/stt-models ./install.sh
 #
-# NB: this installs deps + model. Building/installing the engine itself (meson,
-# whisper.cpp, pywhispercpp) is separate -- see INSTALL.md.
+# NB: building/installing the engine itself (meson, whisper.cpp, pywhispercpp)
+# is separate -- see INSTALL.md. Run this AFTER `meson install`: meson writes a
+# launcher on the system python, and this script replaces it.
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# venv + models default to inside this repo dir (self-contained). Both are
-# untracked/gitignored -- only the engine source under IBus-Speech-To-Text/ is
-# versioned. Override with VENV= / MODELS_DIR= to place them elsewhere.
-VENV="${VENV:-$REPO_DIR/venv}"
-MODELS_DIR="${MODELS_DIR:-$REPO_DIR/models}"
+VENV="${VENV:-/opt/ibus-stt/venv}"
+MODELS_DIR="${MODELS_DIR:-/opt/ibus-stt/models}"
 SCHEMA="org.freedesktop.ibus.engine.stt"
 
 echo "ibus-stt setup"
@@ -26,6 +26,12 @@ echo "  repo:   $REPO_DIR"
 echo "  venv:   $VENV"
 echo "  models: $MODELS_DIR"
 echo
+
+# --- dirs: owned by you, so pip and the model download need no sudo ----------
+for d in "$VENV" "$MODELS_DIR"; do
+    mkdir -p "$d" 2>/dev/null || true
+    [[ -w "$d" ]] || sudo install -d -o "$(id -un)" -g "$(id -gn)" "$d"
+done
 
 # --- venv (create if missing; system site-packages for gi/GStreamer) ---------
 if [[ ! -x "$VENV/bin/python" ]]; then
@@ -41,15 +47,17 @@ PIP=("$PY" -m pip)
 
 # --- backend choice ----------------------------------------------------------
 echo "Which speech-recognition backend?"
-echo "  1) Parakeet  [recommended] - fastest (~18x realtime on CPU), does NOT"
-echo "               hallucinate on noise, multilingual (EN + Dutch + 23 more)."
-echo "               No live word-by-word streaming: text appears when you pause."
-echo "  2) Whisper   - very accurate + live streaming pre-edit, BUT hallucinates"
-echo "               on background/fan noise (invents text, stray CJK). GPU advised."
+echo "  1) Ultra     [recommended] - Parakeet post-trained by moondream: same 25"
+echo "               languages, lower WER (esp. in noise). NVIDIA GPU: Photon (bf16,"
+echo "               least VRAM). AMD/CPU: an ONNX export of the same weights."
+echo "  2) Parakeet  - the original v3 model; same speed, a bit less accurate."
+echo "  3) Whisper   - live streaming pre-edit, BUT hallucinates on background"
+echo "               noise (invents text, stray CJK). GPU advised."
 read -rp "Backend [1]: " b; b="${b:-1}"
 case "$b" in
-    1) BACKEND=parakeet ;;
-    2) BACKEND=whisper ;;
+    1) BACKEND=ultra ;;
+    2) BACKEND=parakeet ;;
+    3) BACKEND=whisper ;;
     *) echo "invalid choice"; exit 1 ;;
 esac
 
@@ -71,7 +79,8 @@ echo ">> backend=$BACKEND  device=$DEVICE"
 echo
 
 # --- dependencies + model ----------------------------------------------------
-if [[ "$BACKEND" == parakeet ]]; then
+GPU_VENDOR=""
+if [[ "$BACKEND" == parakeet || "$BACKEND" == ultra ]]; then
     echo "Installing Parakeet deps ..."
     "${PIP[@]}" install --upgrade onnx-asr huggingface_hub
     if [[ "$DEVICE" == gpu ]]; then
@@ -82,6 +91,7 @@ if [[ "$BACKEND" == parakeet ]]; then
            && [[ -n "$ROCM_DIR" ]]; then
             ROCM_VER="$(basename "$ROCM_DIR" | sed 's/rocm-//;s/\.[0-9]*$//')"  # 6.4.0 -> 6.4
             echo "Detected AMD GPU + ROCm $ROCM_VER -> installing onnxruntime-rocm."
+            GPU_VENDOR=amd
             # Use AMD's ROCm-matched wheel index (repo.radeon.com), NOT pypi: the
             # pypi onnxruntime-rocm links libhipblas.so.3 (ROCm 6.5+), but a 6.4
             # box has .so.2 -> the ROCm EP fails to load and it silently drops to
@@ -98,10 +108,11 @@ if [[ "$BACKEND" == parakeet ]]; then
                 sudo apt-get install -y miopen-hip hipfft \
                   || echo "WARN: could not install miopen-hip/hipfft -- run it manually, else GPU falls back to CPU."
             fi
-            echo "The launcher must export HSA_OVERRIDE_GFX_VERSION (gfx1100 -> 11.0.0)"
-            echo "and LD_LIBRARY_PATH=/opt/rocm/lib for the ROCm EP to bind (see INSTALL.md)."
+            # Ultra's Photon runtime is CUDA-only; on AMD the ultra backend runs an
+            # ONNX export of the same weights through onnxruntime-rocm instead.
         else
             echo "Installing onnxruntime-gpu (NVIDIA CUDA) ..."
+            GPU_VENDOR=nvidia
             "${PIP[@]}" install --upgrade onnxruntime-gpu
             # onnxruntime-gpu needs cuDNN 9 + CUDA wheels matching ITS CUDA major.
             # CUDA 13 dropped the -cu13 suffix for the core libs: the CUDA-13
@@ -113,14 +124,21 @@ if [[ "$BACKEND" == parakeet ]]; then
             "${PIP[@]}" install --upgrade nvidia-cudnn-cu13 nvidia-cuda-runtime \
                 || "${PIP[@]}" install --upgrade nvidia-cudnn-cu12 nvidia-cublas-cu12 nvidia-cuda-runtime-cu12 \
                 || echo "WARN: CUDA/cuDNN wheels not installed -- GPU will fall back to CPU."
+            if [[ "$BACKEND" == ultra ]]; then
+                # Photon (moondream -> kestrel + CUDA torch). Telemetry is disabled
+                # in sttgstultra.py; its __main__ self-check proves no network use.
+                echo "Installing Photon runtime for Ultra (moondream; pulls CUDA torch) ..."
+                "${PIP[@]}" install --upgrade moondream \
+                    || echo "WARN: moondream not installed -- Ultra will use the ONNX export instead."
+            fi
         fi
         echo "After 'ibus restart', check the log: providers should list the GPU EP"
         echo "(ROCMExecutionProvider / CUDAExecutionProvider). CPU-only = EP didn't load."
     else
         "${PIP[@]}" install --upgrade onnxruntime
     fi
-    echo "Downloading Parakeet model (~2.4 GB, cached in ~/.cache/huggingface) ..."
-    "$PY" "$REPO_DIR/download_model.py" --parakeet
+    echo "Downloading $BACKEND model (cached in ~/.cache/huggingface) ..."
+    "$PY" "$REPO_DIR/download_model.py" --"$BACKEND"
 else
     echo "Downloading Whisper model into $MODELS_DIR ..."
     "${PIP[@]}" install --upgrade huggingface_hub
@@ -131,6 +149,42 @@ else
         echo "      not a pip package. Rebuild pywhispercpp with GPU support (INSTALL.md)."
     fi
 fi
+
+# --- launcher + log ------------------------------------------------------------
+# AMD: pin the GPU. ROCR_VISIBLE_DEVICES takes the device INDEX (rocminfo
+# order), NOT rocm-smi's GUID -- a GUID matches nothing, ROCm then sees no GPU
+# and the engine silently runs on CPU. Never HSA_OVERRIDE_GFX_VERSION: it is a
+# global override that disables every GPU of a different gfx version.
+PIN_LINE=""
+if [[ "$GPU_VENDOR" == amd ]]; then
+    echo
+    echo "ROCm GPUs (index: gfx target, name). Integrated ones like gfx90c/gfx902"
+    echo "have no ROCm 6.4 kernels and crash on first decode -- pick a discrete card."
+    env -u ROCR_VISIBLE_DEVICES "$(command -v rocminfo || echo "$ROCM_DIR/bin/rocminfo")" 2>/dev/null \
+        | awk '/^  Name: +gfx/{g=$2} /Marketing Name/ && g {sub(/.*Marketing Name: +/, ""); print "  " n++ ": " g ", " $0; g=""}'
+    PIN=""
+    until [[ "$PIN" =~ ^[0-9]+$ ]]; do
+        read -rp "GPU index for STT (no default): " PIN
+    done
+    PIN_LINE="export ROCR_VISIBLE_DEVICES=$PIN"
+fi
+LD_LINE=""
+if [[ "$BACKEND" == whisper ]]; then
+    # _pywhispercpp.so's RUNPATH points at its build dir; libwhisper.so.1 sits in
+    # the venv's site-packages, so the loader needs it on the path.
+    SITE="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+    LD_LINE="export LD_LIBRARY_PATH=$SITE\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+fi
+echo
+echo "Writing launcher /usr/libexec/ibus-engine-stt -> $PY (needs sudo) ..."
+LAUNCHER=('#!/bin/sh' '# Written by install.sh; re-run it after `meson install`, which overwrites this.')
+[[ -n "$PIN_LINE" ]] && LAUNCHER+=("$PIN_LINE")
+[[ -n "$LD_LINE" ]] && LAUNCHER+=("$LD_LINE")
+LAUNCHER+=("exec $PY /usr/share/ibus-stt/main.py --debug \"\$@\" >>/var/log/ibus-stt.log 2>&1")
+printf '%s\n' "${LAUNCHER[@]}" | sudo tee /usr/libexec/ibus-engine-stt >/dev/null
+sudo chmod 755 /usr/libexec/ibus-engine-stt
+sudo touch /var/log/ibus-stt.log
+sudo chown "$(id -un):$(id -gn)" /var/log/ibus-stt.log
 
 # --- select the backend in gsettings (if the engine/schema is installed) -----
 echo
@@ -144,8 +198,8 @@ fi
 
 echo
 echo "Done. Apply it with:  ibus restart"
-if [[ "$DEVICE" == gpu && "$BACKEND" == parakeet ]]; then
-    echo "If the engine log shows a CPU fallback, the GPU EP's libs aren't on the"
-    echo "library path -- ROCm: LD_LIBRARY_PATH=/opt/rocm/lib + MIOpen/hipFFT +"
-    echo "HSA_OVERRIDE_GFX_VERSION; CUDA: the venv's nvidia/*/lib. Still runs on CPU."
+if [[ "$DEVICE" == gpu && "$BACKEND" != whisper ]]; then
+    echo "Check the log: 'Parakeet model ready (ROCm/...)' or '(CUDA/...)' = GPU;"
+    echo "'(CPU/...)' or 'ROCm pre-flight found no usable GPU' = it fell back. ROCm:"
+    echo "check the GPU index (rocminfo) + MIOpen/hipFFT; CUDA: the venv's nvidia/*/lib."
 fi

@@ -62,6 +62,15 @@ def download_parakeet():
 
 
 def download_ultra():
+    import importlib.util
+    if importlib.util.find_spec("kestrel") is None:
+        # No Photon (AMD/CPU): the engine runs the pinned ONNX export instead.
+        # Reuse its loader so the repo + revision pin lives in one place.
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine"))
+        from sttgstultra import _ultra_onnx_dir
+        print("No Photon installed -> fetching the Ultra ONNX export (~2.5 GB) ...")
+        print(f"Parakeet Ultra (ONNX) at {_ultra_onnx_dir()}")
+        return
     from huggingface_hub import snapshot_download
     print("Downloading moondream/parakeet-ultra (~1.26 GB) to the HF cache ...")
     # Weights only, straight from HF -- Photon itself is never started here,
