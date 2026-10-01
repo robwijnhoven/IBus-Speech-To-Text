@@ -35,6 +35,7 @@ one string out.
 
 import logging
 import queue
+import subprocess
 import threading
 import time
 
@@ -104,6 +105,35 @@ MIN_SEGMENT_S = 0.2
 # ponytail: a plain constant, not a gsetting -- promote to config only if the
 # two machines need different values.
 PARTIAL_INTERVAL_S = 0.8
+
+
+def _rocm_ep_usable():
+    """True if the ROCm execution provider can actually bind a device right now.
+
+    With no visible device (dead KFD node after boot, or a ROCR_VISIBLE_DEVICES
+    that matches nothing) onnxruntime-rocm dies with an *uncatchable* native
+    std::terminate ("HIP failure 100: no ROCm-capable device") at session
+    creation -- try/except can't save the engine process. So probe in a child
+    with only the ROCm EP and read its exit code (abort/error/timeout = no GPU).
+    The child inherits ROCR_VISIBLE_DEVICES from the launcher, so it sees exactly
+    the GPU the engine would. The probe model is onnx-asr's own 139KB preprocessor:
+    always installed, and EP creation is what aborts, not the model.
+    """
+    import os
+    import sys
+    import onnxruntime as _rt
+    if "ROCMExecutionProvider" not in _rt.get_available_providers():
+        return False
+    probe = os.path.join(os.path.dirname(onnx_asr.__file__),
+                         "preprocessors", "data", "nemo128.onnx")
+    code = ("import onnxruntime as r;"
+            f"r.InferenceSession({probe!r},providers=['ROCMExecutionProvider'])")
+    try:
+        return subprocess.run([sys.executable, "-c", code],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=90).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
 
 
 class STTGstParakeet(STTGstBase):
@@ -342,16 +372,20 @@ class STTGstParakeet(STTGstBase):
                     _rt.preload_dlls()
                 except Exception as e:
                     LOG_MSG.debug("onnxruntime.preload_dlls() failed: %s", e)
+            if gpu_ep == "ROCMExecutionProvider" and not _rocm_ep_usable():
+                LOG_MSG.warning("ROCm pre-flight found no usable GPU device "
+                                "(dead KFD node or bad ROCR_VISIBLE_DEVICES); "
+                                "running on CPU.")
+                gpu_ep = None
             providers = ([gpu_ep] if gpu_ep else []) + ["CPUExecutionProvider"]
             _gpu_label = {"ROCMExecutionProvider": "ROCm",
                           "CUDAExecutionProvider": "CUDA"}.get(gpu_ep, "CPU")
             _qlabel = QUANTIZATION or "fp32"
             LOG_MSG.info("Loading Parakeet model: %s (providers=%s, quant=%s; "
                          "first run downloads it to the HF cache)",
-                         PARAKEET_MODEL, providers, _qlabel)
+                         self.get_configured_model_name(), providers, _qlabel)
             try:
-                self._asr = onnx_asr.load_model(
-                    PARAKEET_MODEL, quantization=QUANTIZATION, providers=providers)
+                self._asr = self._load_onnx(providers)
                 self._provider_label = f"{_gpu_label}/{_qlabel}"
             except Exception as gpu_err:
                 # A half-configured GPU (e.g. onnxruntime-gpu without cuDNN) can
@@ -360,9 +394,7 @@ class STTGstParakeet(STTGstBase):
                 if len(providers) > 1:
                     LOG_MSG.warning("Parakeet load with %s failed (%s); "
                                     "retrying CPU-only", providers, gpu_err)
-                    self._asr = onnx_asr.load_model(
-                        PARAKEET_MODEL, quantization=QUANTIZATION,
-                        providers=["CPUExecutionProvider"])
+                    self._asr = self._load_onnx(["CPUExecutionProvider"])
                     self._provider_label = f"CPU/{_qlabel} (fallback)"
                 else:
                     raise
@@ -444,9 +476,7 @@ class STTGstParakeet(STTGstBase):
             LOG_MSG.warning("GPU decode failed (%s); retrying on CPU", e)
             try:
                 if self._asr_cpu is None:
-                    self._asr_cpu = onnx_asr.load_model(
-                        PARAKEET_MODEL, quantization=QUANTIZATION,
-                        providers=["CPUExecutionProvider"])
+                    self._asr_cpu = self._load_onnx(["CPUExecutionProvider"])
                 return (self._asr_cpu.recognize(audio) or "").strip()
             except Exception as e2:
                 # "" lets the worker fall back to the last partial.
@@ -516,6 +546,14 @@ class STTGstParakeet(STTGstBase):
         return (self._vad.backend_name,
                 bool(self._recognizing and self._vad._in_speech))
 
+    def _load_onnx(self, providers):
+        """Build the onnx-asr session. Subclasses swap the weights here only."""
+        return onnx_asr.load_model(PARAKEET_MODEL, quantization=QUANTIZATION,
+                                   providers=providers)
+
+    def get_configured_model_name(self):
+        return PARAKEET_MODEL
+
     def get_model_name(self):
         """Name of the *loaded* model, or None while it is not usable yet.
 
@@ -523,7 +561,7 @@ class STTGstParakeet(STTGstBase):
         goes green on a non-None name, so returning the configured name
         unconditionally showed 'ready' during the ~8s load (and after a failure).
         """
-        return PARAKEET_MODEL if self._asr is not None else None
+        return self.get_configured_model_name() if self._asr is not None else None
 
     def get_model_status(self):
         """'idle' | 'loading' | 'ready' | 'failed' -- for the widget label."""

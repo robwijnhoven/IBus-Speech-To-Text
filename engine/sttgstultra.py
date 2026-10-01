@@ -18,6 +18,15 @@ Everything except model load + decode is inherited from STTGstParakeet:
 capture graph, Silero VAD segmentation, live partial previews, and the
 "commit the last partial if the final is empty/failed" guard.
 
+TWO RUNTIMES, same weights. Photon ships CUDA-only kernels (kestrel_kernels/cu12,
+linked against libcudart.so.12; no ROCm build), so on the AMD desktop it cannot
+run. There -- or wherever kestrel isn't installed, or Photon fails to load --
+we load a community ONNX export of the same checkpoint (ULTRA_ONNX_REPO, pinned
+to the revision we benchmarked) through the base class's onnx-asr path, which
+brings the ROCm pre-flight, CPU fallback and OOM retry with it. Measured on the
+the desktop's AMD GPU (fp32, ROCm EP): 127ms for 11s audio, 328ms for 34s -- the same speed
+as v3; the gain over v3 is accuracy, not speed.
+
 PRIVACY: Photon ships usage telemetry (hostname, GPU, request counts every 60s
 to api.moondream.ai) and a startup thread that pings huggingface.co for
 config.json. Both are disabled in _photon_private() before the engine is
@@ -26,6 +35,7 @@ __main__ self-check proves it: it loads and decodes with every outbound socket
 connect raising.
 """
 
+import importlib.util
 import logging
 import os
 
@@ -40,6 +50,38 @@ BATCH_CAPACITY = 1
 # CUDA graphs cut per-decode launch overhead but cost VRAM per captured shape.
 # ponytail: set False if VRAM gets tight on the 4GB card.
 CUDA_GRAPHS = True
+
+# ONNX export of the same weights for non-CUDA boxes. Pinned: a community
+# conversion, so a silent upstream re-export must not change what we decode with.
+ULTRA_ONNX_REPO = "Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx"
+ULTRA_ONNX_REV = "e3501ea6e487974baebd8188c3740800df481380"
+_ONNX_FILES = ["config.json", "vocab.txt", "fp32/*.onnx", "fp32/*.onnx.data*"]
+
+
+def _ultra_onnx_dir():
+    """Local dir in the flat layout onnx-asr wants. The repo keeps the fp32
+    encoder/decoder under fp32/ and vocab/config at the root, and onnx-asr only
+    globs one directory, so symlink them side by side. ~2.5GB on first run."""
+    from huggingface_hub import snapshot_download
+    kw = dict(revision=ULTRA_ONNX_REV, allow_patterns=_ONNX_FILES)
+    try:
+        snap = snapshot_download(ULTRA_ONNX_REPO, local_files_only=True, **kw)
+    except Exception:
+        LOG_MSG.info("Downloading %s (~2.5GB, first run only)", ULTRA_ONNX_REPO)
+        snap = snapshot_download(ULTRA_ONNX_REPO, **kw)
+    flat = os.path.join(os.path.expanduser("~/.cache/ibus-stt"),
+                        "parakeet-ultra-onnx-" + ULTRA_ONNX_REV[:8])
+    os.makedirs(flat, exist_ok=True)
+    for sub in ("", "fp32"):
+        d = os.path.join(snap, sub)
+        for name in os.listdir(d):
+            src = os.path.join(d, name)
+            if os.path.isfile(src):
+                dst = os.path.join(flat, name)
+                if os.path.lexists(dst):
+                    os.remove(dst)
+                os.symlink(os.path.realpath(src), dst)
+    return flat
 
 
 def _weights_cached():
@@ -76,11 +118,16 @@ def _photon_private():
 class STTGstUltra(STTGstParakeet):
     __gtype_name__ = 'STTGstUltra'
 
+    _photon = False
+
     def _ensure_model(self):
         if self._asr is not None:
             return True
         if self._asr_load_failed:
             return False
+        if importlib.util.find_spec("kestrel") is None:
+            LOG_MSG.info("Parakeet Ultra: no Photon (kestrel) installed; using ONNX export")
+            return super()._ensure_model()
         self._model_state = "loading"
         try:
             photon = _photon_private()
@@ -90,16 +137,27 @@ class STTGstUltra(STTGstParakeet):
                                single_pass_batch_capacity=BATCH_CAPACITY,
                                enable_cuda_graphs=CUDA_GRAPHS)
             self._provider_label = "Photon/CUDA bf16"
+            self._photon = True
             LOG_MSG.info("Parakeet Ultra ready")
             self._model_state = "ready"
             return True
         except Exception as e:
-            LOG_MSG.error("Failed to load Parakeet Ultra: %s", e, exc_info=True)
-            self._asr_load_failed = True
-            self._model_state = "failed"
-            return False
+            LOG_MSG.error("Photon load failed (%s); falling back to the ONNX export",
+                          e, exc_info=True)
+            self._asr = None
+            return super()._ensure_model()
+
+    def _load_onnx(self, providers):
+        import onnx_asr
+        return onnx_asr.load_model("nemo-conformer-tdt", _ultra_onnx_dir(),
+                                   providers=providers)
+
+    def get_configured_model_name(self):
+        return ULTRA_MODEL
 
     def _decode(self, audio, source):
+        if not self._photon:
+            return super()._decode(audio, source)
         try:
             out = self._asr.transcribe(audio=audio, sample_rate=SAMPLE_RATE)
             return (out.get("text") or "").strip()
@@ -110,11 +168,8 @@ class STTGstUltra(STTGstParakeet):
             LOG_MSG.error("Ultra decode failed: %s", e, exc_info=True)
             return ""
 
-    def get_model_name(self):
-        return ULTRA_MODEL if self._asr is not None else None
-
     def destroy(self):
-        if self._asr is not None:
+        if self._photon and self._asr is not None:
             self._asr.close()
         super().destroy()
 
