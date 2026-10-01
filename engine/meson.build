@@ -5,6 +5,8 @@ stt_sources = [
     'sttengine.py',
     'sttgstvosk.py',
     'sttgstwhisper.py',
+    'sttgstparakeet.py',
+    'sttgstultra.py',
     'sttgstfactory.py',
     'sttgstbase.py',
     'sttsegmentprocess.py',
