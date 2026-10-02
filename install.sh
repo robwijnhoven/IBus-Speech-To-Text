@@ -166,7 +166,10 @@ if [[ "$GPU_VENDOR" == amd ]]; then
     until [[ "$PIN" =~ ^[0-9]+$ ]]; do
         read -rp "GPU index for STT (no default): " PIN
     done
-    PIN_LINE="export ROCR_VISIBLE_DEVICES=$PIN"
+    # FAST find mode: skip MIOpen's per-new-shape kernel benchmark. Each new
+    # utterance length otherwise stalls a decode ~2.4s until the cache warms.
+    PIN_LINE="export ROCR_VISIBLE_DEVICES=$PIN
+export MIOPEN_FIND_MODE=FAST"
 fi
 LD_LINE=""
 if [[ "$BACKEND" == whisper ]]; then
