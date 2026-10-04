@@ -423,10 +423,25 @@ class STTGstParakeet(STTGstBase):
     def _process_worker(self):
         # Load up front so the wait happens at startup, not mid-sentence.
         self._ensure_model()
+        # Pre-pay ROCm's per-length setup (see PAD_GRID) for every padded length
+        # up to the VAD's 30s cap, shortest first, one per idle poll -- so a real
+        # decode waits for at most one ~0.5s warm-up, never the whole ~30s list.
+        warm = (list(range(PAD_GRID, 30 * SAMPLE_RATE + 1, PAD_GRID))
+                if self._provider_label.startswith("ROCm") else [])
         while not self._stop_processing:
             try:
                 source, audio = self._process_queue.get(timeout=0.1)
             except queue.Empty:
+                if warm:
+                    n = warm.pop(0)
+                    try:
+                        self._asr.recognize(np.zeros(n, np.float32))
+                    except Exception as e:
+                        LOG_MSG.warning("ROCm warm-up stopped at %.1fs: %s", n / SAMPLE_RATE, e)
+                        warm = []
+                    else:
+                        if not warm:
+                            LOG_MSG.info("ROCm warm-up done (up to %.1fs)", n / SAMPLE_RATE)
                 continue
             try:
                 if len(audio) < int(MIN_SEGMENT_S * SAMPLE_RATE):
