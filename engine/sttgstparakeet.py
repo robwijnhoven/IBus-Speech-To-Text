@@ -81,6 +81,13 @@ QUANTIZATION = None
 # (vertical-workspaces) GNOME extension saturating the compositor's main thread.
 # CPU also works (~same speed as int8-on-GPU, zero VRAM) if you ever want it.
 USE_GPU = True
+# ROCm pays a one-off setup per new input length (~2.6s with the EP's default
+# max conv workspace, ~0.5s without), then ~50ms on repeats. Every partial is a
+# new length, so pad audio with silence to this grid (samples) and keep the
+# workspace off: ~60 shapes cover 30s and get cached within minutes. Measured
+# 2026-10-04 on jfk.wav: padded text identical.
+PAD_GRID = 8000
+ROCM_OPTIONS = {"miopen_conv_use_max_workspace": "0"}
 # Ignore VAD segments shorter than this -- nothing useful in a sub-200ms blip.
 MIN_SEGMENT_S = 0.2
 
@@ -382,7 +389,8 @@ class STTGstParakeet(STTGstBase):
                                 "(dead KFD node or bad ROCR_VISIBLE_DEVICES); "
                                 "running on CPU.")
                 gpu_ep = None
-            providers = ([gpu_ep] if gpu_ep else []) + ["CPUExecutionProvider"]
+            gpu = (gpu_ep, ROCM_OPTIONS) if gpu_ep == "ROCMExecutionProvider" else gpu_ep
+            providers = ([gpu] if gpu_ep else []) + ["CPUExecutionProvider"]
             _gpu_label = {"ROCMExecutionProvider": "ROCm",
                           "CUDAExecutionProvider": "CUDA"}.get(gpu_ep, "CPU")
             _qlabel = QUANTIZATION or "fp32"
@@ -422,6 +430,11 @@ class STTGstParakeet(STTGstBase):
                 continue
             try:
                 if len(audio) < int(MIN_SEGMENT_S * SAMPLE_RATE):
+                    continue
+                # A tick sees qsize()==0 while we are mid-decode, so a partial can
+                # queue up and then sit ahead of the final. Anything newer behind
+                # it supersedes it -- skip it rather than delay the commit.
+                if source == 'partial' and not self._process_queue.empty():
                     continue
                 if not self._ensure_model():
                     continue
@@ -473,6 +486,7 @@ class STTGstParakeet(STTGstBase):
         ponytail: CPU fallback is ~11x realtime (20s audio ~2s); if OOMs get
         frequent, set USE_GPU=False or reload the GPU session to reset its arena.
         """
+        audio = np.pad(audio, (0, -len(audio) % PAD_GRID))
         try:
             return (self._asr.recognize(audio) or "").strip()
         except Exception as e:
@@ -646,11 +660,33 @@ if __name__ == "__main__":
         def recognize(self, a): return " hello "
     from types import SimpleNamespace
     dec = STTGstParakeet._decode
-    assert dec(SimpleNamespace(_asr=_Boom(), _asr_cpu=_Ok()), None, 'final') == "hello"
-    assert dec(SimpleNamespace(_asr=_Boom(), _asr_cpu=_Boom()), None, 'final') == ""
+    a = np.zeros(100, np.float32)
+    assert dec(SimpleNamespace(_asr=_Boom(), _asr_cpu=_Ok()), a, 'final') == "hello"
+    assert dec(SimpleNamespace(_asr=_Boom(), _asr_cpu=_Boom()), a, 'final') == ""
     try:
-        dec(SimpleNamespace(_asr=_Boom(), _asr_cpu=_Ok()), None, 'partial')
+        dec(SimpleNamespace(_asr=_Boom(), _asr_cpu=_Ok()), a, 'partial')
         raise AssertionError("partial must raise")
     except RuntimeError:
         pass
+
+    # Audio reaches the model padded to the PAD_GRID (fewer shapes for ROCm).
+    class _Len:
+        def recognize(self, a): return str(len(a))
+    for n, want in [(100, PAD_GRID), (PAD_GRID, PAD_GRID), (PAD_GRID + 1, 2 * PAD_GRID)]:
+        assert dec(SimpleNamespace(_asr=_Len()), np.zeros(n, np.float32), 'final') == str(want)
+
+    # A partial queued ahead of a final is skipped, not decoded first.
+    w = SimpleNamespace(_process_queue=queue.Queue(), _stop_processing=False,
+                        _ensure_model=lambda: True, _provider_label="test",
+                        _last_partial_text="", decoded=[])
+    def _fake_decode(audio, source):
+        w.decoded.append(source)
+        w._stop_processing = (source == 'final')
+        return ""
+    w._decode = _fake_decode
+    seg = np.zeros(SAMPLE_RATE, np.float32)
+    w._process_queue.put(('partial', seg))
+    w._process_queue.put(('final', seg))
+    STTGstParakeet._process_worker(w)
+    assert w.decoded == ['final'], w.decoded
     print("sttgstparakeet self-check: OK")
