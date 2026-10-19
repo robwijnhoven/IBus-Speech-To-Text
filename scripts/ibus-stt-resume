@@ -1,13 +1,12 @@
 #!/bin/sh
-# systemd system-sleep hook: restart IBus after resume so the STT whisper model
-# reloads into a fresh GPU context.
+# systemd system-sleep hook: restart IBus after resume so the STT model -- any
+# backend (ultra, parakeet, whisper, vosk) -- reloads into a fresh GPU context.
 #
-# Why: deep sleep suspends the GPU. The GPU context behind the VRAM-resident
-# whisper model comes back degraded on resume, and whisper keeps decoding against
-# it with no reload or error. Because the language param is only a soft bias
-# (not a hard lock), a degraded context drifts to the wrong language (observed:
-# English dictation coming out as Dutch). `ibus restart` reloads the model into a
-# fresh GPU context and fixes it.
+# Why: deep sleep suspends the GPU. The GPU context behind a VRAM-resident model
+# comes back degraded on resume, and the backend keeps decoding against it with
+# no reload or error. Seen with whisper (English dictation drifting to Dutch,
+# since its language param is only a soft bias) and with ultra. `ibus restart`
+# reloads whichever backend is selected into a fresh GPU context and fixes it.
 #
 # Install (as root):
 #   install -m 755 ibus-stt-resume /usr/lib/systemd/system-sleep/ibus-stt-resume
